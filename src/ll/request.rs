@@ -750,7 +750,6 @@ mod op {
         pub(crate) fn size(&self) -> u32 {
             self.arg.size
         }
-        /// Only supported with ABI >= 7.9
         pub(crate) fn lock_owner(&self) -> Option<LockOwner> {
             if self.read_flags().contains(ReadFlags::FUSE_READ_LOCKOWNER) {
                 Some(LockOwner(self.arg.lock_owner))
@@ -758,7 +757,7 @@ mod op {
                 None
             }
         }
-        /// The file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
+        /// The file flags, such as `O_SYNC`
         pub(crate) fn flags(&self) -> OpenFlags {
             OpenFlags(self.arg.flags)
         }
@@ -799,7 +798,6 @@ mod op {
         pub(crate) fn write_flags(&self) -> WriteFlags {
             WriteFlags::from_bits_retain(self.arg.write_flags)
         }
-        /// `lock_owner`: only supported with ABI >= 7.9
         pub(crate) fn lock_owner(&self) -> Option<LockOwner> {
             if self
                 .write_flags()
@@ -810,7 +808,7 @@ mod op {
                 None
             }
         }
-        /// flags: these are the file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
+        /// flags: these are the file flags, such as `O_SYNC`
         pub(crate) fn flags(&self) -> OpenFlags {
             OpenFlags(self.arg.flags)
         }
@@ -1086,9 +1084,7 @@ mod op {
             }
 
             let init = init.as_bytes();
-            let init = if self.arg.minor < 5 {
-                &init[..FUSE_COMPAT_INIT_OUT_SIZE]
-            } else if self.arg.minor < 23 {
+            let init = if self.arg.minor < 23 {
                 &init[..FUSE_COMPAT_22_INIT_OUT_SIZE]
             } else {
                 init
@@ -1297,8 +1293,7 @@ mod op {
     /// [`FSync`]). There are also some flags (`direct_io`, `keep_cache`) which the
     /// filesystem may set, to change the way the file is opened. See `fuse_file_info`
     /// structure in <`fuse_common.h`> for more details. If this method is not
-    /// implemented or under Linux kernel versions earlier than 2.6.15, the [`MkNod`]
-    /// and [`Open`] methods will be called instead.
+    /// implemented, the [`MkNod`] and [`Open`] methods will be called instead.
     #[derive(Debug)]
     pub(crate) struct Create<'a> {
         #[expect(dead_code)]

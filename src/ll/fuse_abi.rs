@@ -6,19 +6,15 @@
 //! of a filesystem.
 //!
 //! macfuse (macOS): <https://github.com/macfuse/library/blob/master/include/fuse_kernel.h>
-//! - supports ABI 7.8 in OSXFUSE 2.x
 //! - supports ABI 7.19 since OSXFUSE 3.0.0
 //!
 //! libfuse (Linux/BSD): <https://github.com/libfuse/libfuse/blob/master/include/fuse_kernel.h>
-//! - supports ABI 7.8 since FUSE 2.6.0
-//! - supports ABI 7.12 since FUSE 2.8.0
-//! - supports ABI 7.18 since FUSE 2.9.0
-//! - supports ABI 7.19 since FUSE 2.9.1
 //! - supports ABI 7.26 since FUSE 3.0.0
 //!
 //! FreeBSD kernel headers: <https://github.com/freebsd/freebsd-src/blob/main/sys/fs/fuse/fuse_kernel.h>
 //!
-//! Items without a version annotation are valid with ABI 7.8 and later
+//! Items without a version annotation are valid with ABI 7.19 and later, the oldest a session
+//! will negotiate on any platform: see [`MIN_ABI_VERSION`]
 
 #![warn(missing_debug_implementations)]
 #![allow(missing_docs)]
@@ -46,6 +42,21 @@ pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = if cfg!(target_os = "macos") {
     // `UNSUPPORTED_CAPABILITIES`, so declaring this adds no obligation beyond the
     // notification itself
     44
+};
+
+/// The oldest ABI a session will negotiate. Anything below it is refused during the handshake.
+///
+/// On Linux that is 7.37, which is what Linux 6.1 speaks. 6.1 is the oldest kernel still under
+/// long-term support, every LTS series before it having reached end of life.
+///
+/// Elsewhere it is 7.19, what macFUSE 3.0 speaks and what this crate reports on macOS; FreeBSD
+/// has been above it since fusefs existed. Nothing older ever worked: `fuse_attr` has carried
+/// `blksize` since 7.9, so a kernel below that sizes every attribute reply differently than
+/// this crate writes it.
+pub(crate) const MIN_ABI_VERSION: Version = if cfg!(target_os = "linux") {
+    Version(7, 37)
+} else {
+    Version(7, 19)
 };
 
 #[repr(C)]
@@ -605,7 +616,8 @@ pub(crate) struct fuse_init_in {
     pub(crate) unused: [u32; 11],
 }
 
-pub(crate) const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
+/// How much of `fuse_init_out` a kernel below 7.23 reads. It rejects a longer reply, so the
+/// reply has to be cut to this. Only macFUSE reaches it now, Linux having spoken 7.23 since 4.5
 pub(crate) const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 
 #[repr(C)]

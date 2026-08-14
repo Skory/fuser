@@ -430,14 +430,14 @@ impl<FS: Filesystem> Session<FS> {
                 continue;
             }
 
-            // We don't support ABI versions before 7.6
-            if v < Version(7, 6) {
-                error!("Unsupported FUSE ABI version {v}");
+            if v < abi::MIN_ABI_VERSION {
+                let min = abi::MIN_ABI_VERSION;
+                error!("Unsupported FUSE ABI version {v}, the minimum is {min}");
                 <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
                     .send_ll(&ResponseErrno(ll::Errno::EPROTO));
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    format!("Unsupported FUSE ABI version {v}"),
+                    format!("Unsupported FUSE ABI version {v}, the minimum is {min}"),
                 ));
             }
 
@@ -1443,17 +1443,9 @@ mod test {
             &Config::default(),
         )
         .unwrap();
-        // FUSE_TMPFILE arrived in ABI 7.37, and a kernel without it has no tmpfile inode
-        // operation at all, so it answers O_TMPFILE itself without asking the filesystem
-        // anything. fuser supports back to 7.6, so that is not a failure of this change
-        let supported = session.proto_version.is_some_and(|v| v >= Version(7, 37));
+        // FUSE_TMPFILE arrived in ABI 7.37, which every kernel this crate will negotiate with
+        // speaks
         let bg = session.spawn().unwrap();
-        if !supported {
-            eprintln!("skipping tmpfile_open: the kernel's FUSE protocol predates 7.37");
-            bg.umount_and_join().unwrap();
-            ManuallyDrop::into_inner(tmp);
-            return;
-        }
 
         let opened = nix::fcntl::open(
             &mountpoint,

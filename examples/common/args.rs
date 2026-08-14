@@ -22,7 +22,7 @@ pub struct CommonArgs {
 
     /// Use `FUSE_DEV_IOC_CLONE` to give each worker thread its own fd.
     /// This enables more efficient request processing
-    /// when multiple threads are used. Requires Linux 4.5+.
+    /// when multiple threads are used. Linux only.
     #[clap(long)]
     pub clone_fd: bool,
 }

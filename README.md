@@ -123,6 +123,8 @@ Most features of libfuse up to 3.10.3 are implemented. Feel free to contribute. 
 
 Developed and tested on Linux. Tested under [Linux][FUSE for Linux] and [FreeBSD][FUSE for FreeBSD] using stable [Rust] (see CI for details).
 
+On Linux, kernel 6.1 or newer is required: that is the oldest series still under long-term support, and it speaks FUSE ABI 7.37. A session refuses to mount against an older kernel. Other platforms need ABI 7.19, which macFUSE has spoken since 3.0 and FreeBSD's fusefs always has.
+
 ## License
 
 Licensed under [MIT License](LICENSE.md), except for those files in `examples/` that explicitly contain a different license.

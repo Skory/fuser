@@ -882,8 +882,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// operation. fh will contain the value set by the open method, or will be undefined
     /// if the open method didn't set any value.
     ///
-    /// flags: these are the file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
-    /// `lock_owner`: only supported with ABI >= 7.9
+    /// flags: these are the file flags, such as `O_SYNC`
     fn read(
         &self,
         _req: &Request,
@@ -912,8 +911,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// `write_flags`: will contain `FUSE_WRITE_CACHE`, if this write is from the page cache. If set,
     /// the pid, uid, gid, and fh may not match the value that would have been sent if write cachin
     /// is disabled
-    /// flags: these are the file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
-    /// `lock_owner`: only supported with ABI >= 7.9
+    /// flags: these are the file flags, such as `O_SYNC`
     fn write(
         &self,
         _req: &Request,
@@ -1118,8 +1116,7 @@ pub trait Filesystem: Send + Sync + 'static {
 
     /// Check file access permissions.
     /// This will be called for the `access()` system call. If the `default_permissions`
-    /// mount option is given, this method is not called. This method is not called
-    /// under Linux kernel versions 2.4.x
+    /// mount option is given, this method is not called.
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         warn!("[Not Implemented] access(ino: {ino:#x?}, mask: {mask})");
         reply.error(Errno::ENOSYS);
@@ -1133,8 +1130,8 @@ pub trait Filesystem: Send + Sync + 'static {
     /// read, write, flush, release, and fsync. Additionally, the filesystem may set
     /// certain flags like `direct_io` and `keep_cache` to change the way the file is
     /// opened. See `fuse_file_info` structure in <`fuse_common.h`> for more details. If
-    /// this method is not implemented or under Linux kernel versions earlier than
-    /// 2.6.15, the `mknod()` and `open()` methods will be called instead.
+    /// this method is not implemented, the `mknod()` and `open()` methods will be called
+    /// instead.
     ///
     /// `kill_suid_gid` asks the filesystem to clear the suid and sgid bits of an existing file,
     /// because the open truncates it and the caller lacks `CAP_FSETID`. It is only ever set once

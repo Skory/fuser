@@ -67,7 +67,7 @@ impl Channel {
     /// enabling true parallel request processing. The kernel distributes
     /// requests across all cloned fds.
     ///
-    /// Requires Linux 4.5+. Returns an error on older kernels or non-Linux.
+    /// Returns an error on non-Linux platforms.
     #[cfg(target_os = "linux")]
     pub(crate) fn clone_fd(&self) -> io::Result<Channel> {
         use std::os::fd::AsRawFd;

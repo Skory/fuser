@@ -1,6 +1,12 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* **Breaking:** Linux 6.1 is now the minimum supported kernel, and a session refuses to mount
+  against an older one rather than negotiating down to it. 6.1 speaks FUSE ABI 7.37 and is the
+  oldest series still under long-term support, every LTS before it having reached end of life.
+  The floor on other platforms is ABI 7.19, what macFUSE has spoken since 3.0 and what FreeBSD's
+  fusefs has always been above; the ABI 7.6 fuser used to claim never worked, since the
+  attribute replies it writes have carried the 7.9 layout throughout
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap
