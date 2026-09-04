@@ -1,6 +1,9 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add `ReplyData::fill()`, which lets `read()` write its data straight into the reply buffer.
+  Over io_uring that is the ring entry itself, saving the copy from the filesystem's buffer;
+  over `/dev/fuse` it behaves like `data()`
 * Add `Config::io_uring` and `Config::io_uring_queue_depth` (default 8), which serve the
   session over FUSE-over-io_uring instead of `/dev/fuse` reads and writes. This needs the
   `io-uring` cargo feature, Linux 6.14 or later and the fuse module parameter

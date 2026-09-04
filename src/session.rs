@@ -2092,6 +2092,186 @@ mod test {
         ManuallyDrop::into_inner(tmp);
     }
 
+    /// A root with one 5000-byte file whose `read` answers through `ReplyData::fill`
+    struct FillFs {
+        foreign: bool,
+        panic: bool,
+        destroyed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    const FILL_FILE_LEN: usize = 5000;
+
+    fn fill_byte(offset: usize) -> u8 {
+        (offset % 251) as u8
+    }
+
+    impl FillFs {
+        fn attr(ino: crate::INodeNo) -> crate::FileAttr {
+            let (kind, size, perm) = match ino.0 {
+                2 => (crate::FileType::RegularFile, FILL_FILE_LEN as u64, 0o644),
+                _ => (crate::FileType::Directory, 0, 0o755),
+            };
+            crate::FileAttr {
+                ino,
+                size,
+                blocks: size.div_ceil(512),
+                atime: std::time::SystemTime::UNIX_EPOCH,
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                ctime: std::time::SystemTime::UNIX_EPOCH,
+                crtime: std::time::SystemTime::UNIX_EPOCH,
+                kind,
+                perm,
+                nlink: 1,
+                uid: geteuid().as_raw(),
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+                flags: 0,
+            }
+        }
+    }
+
+    impl Filesystem for FillFs {
+        fn destroy(&mut self) {
+            self.destroyed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn lookup(
+            &self,
+            _req: &Request,
+            _parent: crate::INodeNo,
+            name: &std::ffi::OsStr,
+            reply: crate::ReplyEntry,
+        ) {
+            if name == "data.bin" {
+                reply.entry(
+                    &std::time::Duration::ZERO,
+                    &Self::attr(crate::INodeNo(2)),
+                    crate::Generation(0),
+                );
+            } else {
+                reply.error(Errno::ENOENT);
+            }
+        }
+        fn getattr(
+            &self,
+            _req: &Request,
+            ino: crate::INodeNo,
+            _fh: Option<crate::FileHandle>,
+            reply: crate::ReplyAttr,
+        ) {
+            reply.attr(&std::time::Duration::ZERO, &Self::attr(ino));
+        }
+        /// Direct I/O without flush, so a `read(2)` is exactly one READ and `close(2)` sends
+        /// nothing synchronous: once the panicking session's only thread is gone, any further
+        /// request (the synchronous READ after a failed readahead, the FLUSH on close) would
+        /// block the reader until the connection is aborted
+        fn open(
+            &self,
+            _req: &Request,
+            _ino: crate::INodeNo,
+            _flags: crate::OpenFlags,
+            _kill_suid_gid: bool,
+            reply: crate::ReplyOpen,
+        ) {
+            reply.opened(
+                crate::FileHandle(0),
+                crate::FopenFlags::FOPEN_DIRECT_IO | crate::FopenFlags::FOPEN_NOFLUSH,
+            );
+        }
+        fn read(
+            &self,
+            _req: &Request,
+            _ino: crate::INodeNo,
+            _fh: crate::FileHandle,
+            offset: u64,
+            size: u32,
+            _flags: crate::OpenFlags,
+            _lock_owner: Option<crate::LockOwner>,
+            reply: crate::ReplyData,
+        ) {
+            let panic = self.panic;
+            let answer = move |buf: &mut [u8]| -> Result<usize, Errno> {
+                if panic {
+                    panic!("deliberate panic from a test filesystem's fill closure");
+                }
+                assert_eq!(buf.len(), size as usize);
+                let start = (offset as usize).min(FILL_FILE_LEN);
+                let end = start.saturating_add(size as usize).min(FILL_FILE_LEN);
+                for (i, b) in buf[..end - start].iter_mut().enumerate() {
+                    *b = fill_byte(start + i);
+                }
+                Ok(end - start)
+            };
+            if self.foreign {
+                std::thread::spawn(move || reply.fill(size as usize, answer));
+            } else {
+                reply.fill(size as usize, answer);
+            }
+        }
+    }
+
+    #[test]
+    fn fill_serves_reads() {
+        use std::os::unix::fs::FileExt;
+
+        for foreign in [false, true] {
+            let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+            let mountpoint = tmp.path().canonicalize().unwrap();
+            let fs = FillFs {
+                foreign,
+                panic: false,
+                destroyed: Arc::default(),
+            };
+            let session = Session::new(fs, &mountpoint, &Config::default()).unwrap();
+            let bg = session.spawn().unwrap();
+            let path = mountpoint.join("data.bin");
+            let data = std::fs::read(&path).unwrap();
+            assert_eq!(data.len(), FILL_FILE_LEN, "foreign={foreign}");
+            assert!(data.iter().enumerate().all(|(i, b)| *b == fill_byte(i)));
+            let file = std::fs::File::open(&path).unwrap();
+            let mut tail = [0u8; 64];
+            let n = file.read_at(&mut tail, FILL_FILE_LEN as u64 - 10).unwrap();
+            assert_eq!(n, 10, "foreign={foreign}");
+            assert!(
+                tail[..n]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| *b == fill_byte(FILL_FILE_LEN - 10 + i))
+            );
+            drop(file);
+            bg.umount_and_join().unwrap();
+            ManuallyDrop::into_inner(tmp);
+        }
+    }
+
+    #[test]
+    fn panic_in_fill_answers_eio_and_ends_the_session() {
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+        let destroyed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fs = FillFs {
+            foreign: false,
+            panic: true,
+            destroyed: destroyed.clone(),
+        };
+        let session = Session::new(fs, &mountpoint, &Config::default()).unwrap();
+        let runner = std::thread::spawn(move || session.run());
+        let err = std::fs::read(mountpoint.join("data.bin")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+        let err = runner.join().unwrap().unwrap_err();
+        assert_eq!(err.to_string(), THREAD_PANICKED);
+        assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        assert!(
+            !mounts
+                .lines()
+                .any(|l| l.split(' ').nth(1) == mountpoint.to_str())
+        );
+        ManuallyDrop::into_inner(tmp);
+    }
+
     /// Mounts fusectl when root finds it missing and unmounts it when the last holder drops;
     /// the tests that abort a connection run concurrently on hosts that do not mount it
     pub(super) struct Fusectl;
@@ -2174,6 +2354,7 @@ mod uring_test {
     use std::io::Write;
     use std::mem::ManuallyDrop;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
@@ -2399,6 +2580,12 @@ mod uring_test {
         hold_getattr: Option<Arc<Mutex<Vec<ReplyAttr>>>>,
         /// `getattr` panics
         panic_getattr: bool,
+        /// `read` answers with `ReplyData::fill` instead of `data`
+        fill: bool,
+        /// While set, `read` panics inside its `fill` closure, after touching the buffer
+        panic_fill: Arc<AtomicBool>,
+        /// How many times a `fill` closure of `read` ran
+        fills: Arc<AtomicUsize>,
         /// `init` negotiates `FUSE_ABORT_ERROR`
         abort_error: bool,
         /// `read` of `hello.txt` was dispatched
@@ -2408,6 +2595,16 @@ mod uring_test {
         /// `unlink` hands its reply to the test instead of answering
         unlink_reply: Option<mpsc::Sender<ReplyEmpty>>,
         destroyed: Arc<AtomicUsize>,
+    }
+
+    /// The name of every thread `RingFs` replies from, so log lines can be scoped to them
+    const REPLIER: &str = "ringfs-replier";
+
+    fn replier(reply: impl FnOnce() + Send + 'static) {
+        thread::Builder::new()
+            .name(REPLIER.to_string())
+            .spawn(reply)
+            .unwrap();
     }
 
     impl RingFs {
@@ -2527,8 +2724,32 @@ mod uring_test {
                         tx.send(Instant::now()).unwrap();
                     }
                 });
+            } else if self.panic_fill.load(Ordering::SeqCst) {
+                let answer = |buf: &mut [u8]| -> Result<usize, Errno> {
+                    buf.fill(0xAB);
+                    panic!("deliberate panic from a test filesystem's fill closure");
+                };
+                if self.foreign {
+                    replier(move || reply.fill(size as usize, answer));
+                } else {
+                    reply.fill(size as usize, answer);
+                }
+            } else if self.fill {
+                // The buffer is the size asked for; the file may end before that
+                let fills = self.fills.clone();
+                let answer = move |buf: &mut [u8]| {
+                    fills.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(buf.len(), size as usize);
+                    buf[..data.len()].copy_from_slice(&data);
+                    Ok(data.len())
+                };
+                if self.foreign {
+                    replier(move || reply.fill(size as usize, answer));
+                } else {
+                    reply.fill(size as usize, answer);
+                }
             } else if self.foreign {
-                thread::spawn(move || reply.data(&data));
+                replier(move || reply.data(&data));
             } else {
                 reply.data(&data);
             }
@@ -2823,6 +3044,187 @@ mod uring_test {
         // The ring unit tests run alongside and log errors for their fake rings, numbered 7
         assert!(logged(log::Level::Error, "ring 0").is_empty());
         assert!(logged(log::Level::Error, &format!("leaking {}", reserved_bytes(8))).is_empty());
+        m.finish();
+    }
+
+    fn read_through_fill(m: &Mounted) {
+        assert_eq!(std::fs::read(m.path("hello.txt")).unwrap(), HELLO);
+        let big = std::fs::read(m.path("big.bin")).unwrap();
+        assert_eq!(big.len(), BIG_LEN);
+        assert!(big.iter().enumerate().all(|(i, b)| *b == big_byte(i)));
+        let mut tail = [0u8; 64];
+        let n = std::os::unix::fs::FileExt::read_at(
+            &File::open(m.path("hello.txt")).unwrap(),
+            &mut tail,
+            6,
+        )
+        .unwrap();
+        assert_eq!(&tail[..n], &HELLO[6..]);
+    }
+
+    /// Every closure wrote straight into its ring entry
+    #[test]
+    fn fill_serves_reads() {
+        let _serial = serial();
+        if let Some(why) = uring_unavailable() {
+            eprintln!("skipping fill_serves_reads: {why}");
+            return;
+        }
+        for foreign in [false, true] {
+            let m = Mounted::new();
+            let fills = Arc::new(AtomicUsize::new(0));
+            let fs = RingFs {
+                fill: true,
+                foreign,
+                fills: fills.clone(),
+                ..RingFs::default()
+            };
+            let session = m.session(fs, &ring_config());
+            let rings: Vec<Arc<crate::uring::ring::Ring>> =
+                session.ring.as_ref().unwrap().rings().to_vec();
+            let bg = session.spawn().unwrap();
+            read_through_fill(&m);
+            umount_and_join_within(bg, Duration::from_secs(5)).unwrap();
+            // Every read above ran to EOF, so every READ was answered before the unmount;
+            // the two counters are incremented at different points of a closure that may
+            // run on an unjoined thread, so they are given time to agree
+            let direct = || rings.iter().map(|r| r.direct_fills()).sum::<usize>();
+            let filled = || fills.load(Ordering::SeqCst);
+            assert!(
+                wait_until(|| direct() == filled()),
+                "foreign={foreign}: {} of {} fills went straight into their entry",
+                direct(),
+                filled()
+            );
+            assert!(filled() > 1, "foreign={foreign}");
+            assert!(
+                logged(log::Level::Error, "ring 0").is_empty(),
+                "foreign={foreign}\n{}",
+                session_log()
+            );
+            m.finish();
+        }
+    }
+
+    #[test]
+    fn panic_in_fill_on_a_ring_thread_answers_eio() {
+        let _serial = serial();
+        if let Some(why) = uring_unavailable() {
+            eprintln!("skipping panic_in_fill_on_a_ring_thread_answers_eio: {why}");
+            return;
+        }
+        let m = Mounted::new();
+        let fs = RingFs {
+            panic_fill: Arc::new(AtomicBool::new(true)),
+            ..RingFs::default()
+        };
+        let session = m.session(fs, &ring_config());
+        let abort_path = super::test::fusectl_abort_path(&m.mountpoint);
+        let abort = || {
+            if let Some(path) = &abort_path {
+                let _ = std::fs::write(path, b"1");
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(session.run()).unwrap());
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let path = m.path("hello.txt");
+        thread::spawn(move || read_tx.send(std::fs::read(path).map(drop)).unwrap());
+        let Ok(read) = read_rx.recv_timeout(Duration::from_secs(5)) else {
+            abort();
+            panic!("the read the panicking closure owed was never answered");
+        };
+        assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::EIO));
+        let Ok(reply) = rx.recv_timeout(Duration::from_secs(5)) else {
+            abort();
+            panic!("run did not return after the panic");
+        };
+        assert_eq!(reply.unwrap_err().to_string(), THREAD_PANICKED);
+        if !wait_ring_threads_gone(Duration::from_secs(5)) {
+            abort();
+            panic!("threads still running: {:?}", thread_names());
+        }
+        // The unwind guard answered, and the ring left with nothing in the kernel
+        let guarded = wait_logged_by(
+            "fuser-ring-0",
+            log::Level::Warn,
+            "reply closure for unique",
+            1,
+        );
+        assert!(!guarded.is_empty(), "{}", session_log());
+        let exited = wait_logged(log::Level::Debug, "ring 0 exited, in_kernel=0", 1);
+        assert_eq!(exited.len(), 1, "{}", session_log());
+        assert!(
+            logged_by("fuser-ring-0", log::Level::Warn, "Reply not sent").is_empty(),
+            "{}",
+            session_log()
+        );
+        assert!(
+            logged_by("fuser-ring-0", log::Level::Error, "").is_empty(),
+            "{}",
+            session_log()
+        );
+        m.finish();
+    }
+
+    /// Only here does the guard's re-arming matter, because the session survives the panic
+    #[test]
+    fn panic_in_fill_on_a_foreign_thread_keeps_the_ring_serving() {
+        let _serial = serial();
+        if let Some(why) = uring_unavailable() {
+            eprintln!("skipping panic_in_fill_on_a_foreign_thread_keeps_the_ring_serving: {why}");
+            return;
+        }
+        let m = Mounted::new();
+        let panic_fill = Arc::new(AtomicBool::new(true));
+        let fs = RingFs {
+            fill: true,
+            foreign: true,
+            panic_fill: panic_fill.clone(),
+            ..RingFs::default()
+        };
+        // One entry per queue, so the re-armed entry is the one that serves again
+        let config = Config {
+            io_uring_queue_depth: 1,
+            ..ring_config()
+        };
+        let bg = m.session(fs, &config).spawn().unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        let path = m.path("hello.txt");
+        thread::spawn(move || read_tx.send(std::fs::read(path).map(drop)).unwrap());
+        let read = read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read the panicking closure owed was never answered");
+        assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::EIO));
+        // The guard ran on the filesystem's replier thread, not on the ring thread; the kernel
+        // may retry the failed READ, so there can be more than one such line
+        let guarded = wait_logged_by(REPLIER, log::Level::Warn, "reply closure for unique", 1);
+        assert!(!guarded.is_empty(), "{}", session_log());
+        assert!(logged_by("fuser-ring-", log::Level::Warn, "reply closure").is_empty());
+
+        panic_fill.store(false, Ordering::SeqCst);
+        read_through_fill(&m);
+        umount_and_join_within(bg, Duration::from_secs(5)).unwrap();
+        let exited = wait_logged(log::Level::Debug, "ring 0 exited, in_kernel=0", 1);
+        assert_eq!(exited.len(), 1, "{}", session_log());
+        assert!(
+            logged(log::Level::Error, "ring 0").is_empty(),
+            "{}",
+            session_log()
+        );
+        // The guard's reply was the only one: the replier thread, where a reply object
+        // dropped after the panic would speak up, logged nothing else
+        assert!(
+            logged_by(REPLIER, log::Level::Warn, "Reply not sent").is_empty(),
+            "{}",
+            session_log()
+        );
+        assert!(
+            logged_by(REPLIER, log::Level::Error, "").is_empty(),
+            "{}",
+            session_log()
+        );
         m.finish();
     }
 

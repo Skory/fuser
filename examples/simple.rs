@@ -2027,8 +2027,6 @@ impl Filesystem for SimpleFS {
                 // Could underflow if file length is less than local_start
                 let read_size = min(size, file_size.saturating_sub(offset as u64) as u32);
 
-                let mut buffer = vec![0; read_size as usize];
-                file.read_exact_at(&mut buffer, offset as u64).unwrap();
                 // A reader that asked for O_NOATIME wants to leave no trace, and a read
                 // request carries the flag, so it can be honored here. The flag is Linux's;
                 // neither macOS nor FreeBSD defines it
@@ -2041,7 +2039,20 @@ impl Filesystem for SimpleFS {
                         self.touch_atime(&mut attrs);
                     }
                 }
-                reply.data(&buffer);
+                // The file may have shrunk since its size was read; a short read is the
+                // answer then, not an error
+                reply.fill(read_size as usize, |buf| {
+                    let mut filled = 0;
+                    while filled < buf.len() {
+                        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(Errno::from(e)),
+                        }
+                    }
+                    Ok(filled)
+                });
             }
             _ => {
                 reply.error(Errno::ENOENT);
