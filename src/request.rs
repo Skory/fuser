@@ -55,13 +55,20 @@ impl<'a> RequestWithSender<'a> {
         data: &'a [u8],
         negotiated: InitFlags,
     ) -> Option<RequestWithSender<'a>> {
-        let mut request = match ll::AnyRequest::try_from(data) {
-            Ok(request) => request,
+        match ll::AnyRequest::try_from(data) {
+            Ok(request) => Some(Self::from_request(sender, request, negotiated)),
             Err(err) => {
                 error!("{err}");
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    pub(crate) fn from_request(
+        sender: ReplySender,
+        mut request: ll::AnyRequest<'a>,
+        negotiated: InitFlags,
+    ) -> RequestWithSender<'a> {
         request.set_negotiated(negotiated);
 
         let masked_header =
@@ -73,11 +80,11 @@ impl<'a> RequestWithSender<'a> {
                     ..request.header().clone()
                 });
 
-        Some(Self {
+        Self {
             sender,
             request,
             masked_header,
-        })
+        }
     }
 
     /// Dispatch request to the given filesystem.
@@ -666,7 +673,10 @@ impl<'a> RequestWithSender<'a> {
         Reply::new(self.request.unique(), self.sender())
     }
 
+    /// Every reply object obtains its sender here, so this is where the transport learns that
+    /// a reply is coming.
     fn sender(&self) -> ReplySender {
+        self.sender.reply_created();
         self.sender.clone()
     }
 
