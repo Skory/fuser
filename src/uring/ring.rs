@@ -87,18 +87,32 @@ pub(crate) struct RingIo {
 }
 
 impl RingIo {
-    /// `io_uring_setup`; `EPERM` and `ENOSYS` here mean the environment forbids io_uring.
+    /// `io_uring_setup`; `EPERM` and `ENOSYS` here mean the environment forbids io_uring,
+    /// `EINVAL` a kernel before 6.1 that lacks the setup flags.
     pub(crate) fn open(sq_entries: u32, cq_entries: u32) -> io::Result<Self> {
+        // SINGLE_ISSUER | DEFER_TASKRUN: see the module doc. Created disabled; `enable`
+        // binds the ring thread
         let io = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
             .dontfork()
             .setup_submit_all()
             .setup_cqsize(cq_entries)
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_r_disabled()
             .build(sq_entries)?;
         Ok(Self {
             io,
             #[cfg(test)]
             hooks: test::IoHooks::default(),
         })
+    }
+
+    /// Enables the ring and binds the calling thread as its issuer; every later
+    /// `io_uring_enter` must come from that thread.
+    fn enable(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        self.hooks.before_enable()?;
+        self.io.submitter().register_enable_rings()
     }
 
     fn submit(&mut self) -> io::Result<usize> {
@@ -793,7 +807,7 @@ impl Ring {
             // Nothing was registered, so `in_kernel` is 0 and `Drop` unmaps
             return Ok(());
         }
-        let reg = self.register_all(&mut io);
+        let reg = io.enable().and_then(|()| self.register_all(&mut io));
         let ok = reg.is_ok();
         let _ = registered.send(reg);
         if !ok {
@@ -805,7 +819,7 @@ impl Ring {
             self.index,
             self.entries.len()
         );
-        // Task work for early fetches runs during this recv; their CQEs wait in the CQ
+        // Early fetches are deferred task work until the first io_uring_enter in `serve`
         let mut handler: Box<dyn FetchHandler> = match handler_rx.recv() {
             Ok(h) => h,
             Err(_) if self.live.lock().abandon => {
@@ -1282,6 +1296,8 @@ pub(crate) mod test {
         /// Errno the next `submit` fails with instead of entering the kernel.
         fail_submit: Option<i32>,
         submits: usize,
+        /// Errno `enable` fails with instead of enabling the ring.
+        fail_enable: Option<i32>,
     }
 
     impl IoHooks {
@@ -1291,6 +1307,12 @@ pub(crate) mod test {
                 Some(errno) => Err(io::Error::from_raw_os_error(errno)),
                 None => Ok(()),
             }
+        }
+
+        pub(super) fn before_enable(&mut self) -> io::Result<()> {
+            self.fail_enable
+                .take()
+                .map_or(Ok(()), |errno| Err(io::Error::from_raw_os_error(errno)))
         }
     }
 
@@ -1380,7 +1402,8 @@ pub(crate) mod test {
     }
 
     /// `None` when the environment forbids io_uring (seccomp EPERM, `kernel.io_uring_disabled`,
-    /// or no io_uring at all); the message is visible with `--nocapture`
+    /// or no io_uring at all) or the kernel predates the setup flags; the message is visible
+    /// with `--nocapture`
     fn try_ring_io(sq: u32, cq: u32) -> Option<RingIo> {
         match RingIo::open(sq, cq) {
             Ok(io) => Some(io),
@@ -1388,8 +1411,24 @@ pub(crate) mod test {
                 eprintln!("skipping: io_uring_setup failed with {e}");
                 None
             }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) && flags_unsupported() => {
+                eprintln!(
+                    "skipping: io_uring_setup failed with {e}; SINGLE_ISSUER and DEFER_TASKRUN \
+                     need Linux 6.1"
+                );
+                None
+            }
             Err(e) => panic!("io_uring_setup: {e}"),
         }
+    }
+
+    /// Whether `io_uring_setup` refuses known-good sizes too, which tells a kernel without the
+    /// setup flags apart from an `EINVAL` for the sizes under test
+    fn flags_unsupported() -> bool {
+        static PROBE: OnceLock<bool> = OnceLock::new();
+        *PROBE.get_or_init(
+            || matches!(RingIo::open(8, 16), Err(e) if e.raw_os_error() == Some(libc::EINVAL)),
+        )
     }
 
     fn state_name(e: &RingEntry) -> &'static str {
@@ -1658,7 +1697,10 @@ pub(crate) mod test {
     /// profile without `io_uring_setup`
     #[test]
     fn io_uring_is_available() {
-        RingIo::open(8, 16).expect("io_uring_setup failed; the other ring tests are skipping");
+        RingIo::open(8, 16).expect(
+            "io_uring_setup failed (needs Linux 6.1 and no seccomp/sysctl ban); the other ring \
+             tests are skipping",
+        );
     }
 
     #[test]
@@ -1669,6 +1711,39 @@ pub(crate) mod test {
                 return;
             }
         }
+    }
+
+    /// The thread that enables the ring becomes its issuer: another thread's `io_uring_enter`
+    /// is refused with `EEXIST`, and the SQE it pushed is then submitted by the issuer
+    #[test]
+    fn enabled_ring_submits_only_for_the_enabling_thread() {
+        let Some(mut io) = try_ring_io(8, 16) else {
+            return;
+        };
+        io.enable().unwrap();
+        let (err, mut io) = thread::spawn(move || {
+            let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
+            io.push_or_submit(&nop).unwrap();
+            (io.io.submit().unwrap_err(), io)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(errno_of(&err), Some(libc::EEXIST), "{err}");
+        assert_eq!(io.io.submit_and_wait(1).unwrap(), 1);
+        let cqe = io.io.completion().next().unwrap();
+        assert_eq!((cqe.user_data(), cqe.result()), (WAKE - 1, 0));
+    }
+
+    /// `io_uring_enter` on a ring still `R_DISABLED` fails with `EBADFD`
+    #[test]
+    fn ring_rejects_submission_until_enabled() {
+        let Some(mut io) = try_ring_io(8, 16) else {
+            return;
+        };
+        let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
+        io.push_or_submit(&nop).unwrap();
+        let err = io.io.submit().unwrap_err();
+        assert_eq!(errno_of(&err), Some(libc::EBADFD), "{err}");
     }
 
     #[test]
@@ -1722,6 +1797,35 @@ pub(crate) mod test {
             "nothing was registered"
         );
         assert_eq!(ring.live.lock().in_kernel, 0);
+        drop(ring);
+        assert!(!is_mapped(base));
+    }
+
+    /// An enable failure is reported like a REGISTER submit failure, with nothing registered
+    #[test]
+    fn failed_enable_registers_nothing() {
+        let _serial = UNMAP_CHECK.lock();
+        let Some(mut io) = try_ring_io(8, 16) else {
+            return;
+        };
+        let Some(ring) = big_ring(2, true) else {
+            return;
+        };
+        let base = ring.mem.entry(0).as_ptr() as usize;
+        io.hooks.fail_enable = Some(libc::EBADFD);
+        let started = start(&ring, io);
+        started.go.send(()).unwrap();
+        let err = started
+            .registered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(errno_of(&err), Some(libc::EBADFD));
+        started.thread.join().unwrap().unwrap();
+        assert_eq!(ring.live.lock().in_kernel, 0);
+        for e in &ring.entries {
+            assert_eq!(state_name(e), "Dead", "register_all never ran");
+        }
         drop(ring);
         assert!(!is_mapped(base));
     }
@@ -1780,6 +1884,7 @@ pub(crate) mod test {
         let Some(mut io) = try_ring_io(8, 64) else {
             return;
         };
+        io.enable().unwrap();
         let ring = fake_ring(20, true);
         ring.register_all(&mut io).unwrap();
         // 20 REGISTERs and the poll: the queue fills after 8 and 16, then the final submit
@@ -1816,6 +1921,7 @@ pub(crate) mod test {
                 let ring = Arc::clone(&ring);
                 thread::spawn(move || {
                     ring.ring_thread.set(thread::current().id()).ok();
+                    io.enable().unwrap();
                     let mut handler = |_: RingCommit, _: &[u8]| panic!("nothing is fetched");
                     let outcome = ring.serve(&mut io, &mut handler);
                     (outcome, io)
@@ -1966,6 +2072,7 @@ pub(crate) mod test {
             let ring = Arc::clone(&ring);
             thread::spawn(move || {
                 ring.ring_thread.set(thread::current().id()).ok();
+                io.enable().unwrap();
                 let mut handler = |_: RingCommit, _: &[u8]| {};
                 ring.serve(&mut io, &mut handler)
             })
@@ -2008,6 +2115,7 @@ pub(crate) mod test {
             let ring = Arc::clone(&ring);
             thread::spawn(move || {
                 ring.ring_thread.set(thread::current().id()).ok();
+                io.enable().unwrap();
                 let mut handler = |_: RingCommit, _: &[u8]| {};
                 ring.serve(&mut io, &mut handler)
             })
@@ -2055,6 +2163,7 @@ pub(crate) mod test {
         let Some(mut io) = try_ring_io(16, 32) else {
             return;
         };
+        io.enable().unwrap();
         if !nop_results_supported(&mut io) {
             return;
         }
@@ -2135,6 +2244,7 @@ pub(crate) mod test {
         let Some(mut io) = try_ring_io(8, 16) else {
             return;
         };
+        io.enable().unwrap();
         if !nop_results_supported(&mut io) {
             return;
         }
@@ -2175,6 +2285,7 @@ pub(crate) mod test {
         let Some(mut io) = try_ring_io(8, 16) else {
             return;
         };
+        io.enable().unwrap();
         if !nop_results_supported(&mut io) {
             return;
         }
@@ -2562,6 +2673,7 @@ pub(crate) mod test {
                 let ring = Arc::clone(&ring);
                 thread::spawn(move || {
                     ring.ring_thread.set(thread::current().id()).ok();
+                    io.enable().unwrap();
                     let mut handler = |_: RingCommit, _: &[u8]| {};
                     ring.serve(&mut io, &mut handler)
                 })

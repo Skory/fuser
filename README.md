@@ -139,22 +139,22 @@ and the same command with `--reply-data` for the last two rows, on an AMD EPYC 9
 
 | workload                                 | `/dev/fuse`            | io_uring               |
 |------------------------------------------|------------------------|------------------------|
-| read 4k (MB/s)                           | 154 (149-155)          | 176 (175-178)          |
-| write 4k (MB/s)                          | 142 (137-145)          | 160 (153-180)          |
-| read 128k (MB/s)                         | 2997 (2731-3227)       | 2578 (2529-2872)       |
-| write 128k (MB/s)                        | 967 (914-1014)         | 1141 (1078-1147)       |
-| read 1M (MB/s)                           | 3986 (3491-4123)       | 3976 (3928-4075)       |
-| write 1M (MB/s)                          | 1114 (1094-1358)       | 1302 (1271-1327)       |
-| stat, lookup+getattr, 1 client (ops/s)   | 20705 (19401-22228)    | 22797 (22154-22838)    |
-| stat, lookup+getattr, 8 clients (ops/s)  | 128952 (126303-132982) | 113992 (112298-120149) |
-| pread 4k, 1 client (ops/s)               | 37936 (36888-42556)    | 43389 (42871-49549)    |
-| pread 4k, 8 clients (ops/s)              | 210371 (207443-213340) | 213647 (210189-228476) |
-| pread 64k, 1 client (ops/s)              | 29804 (28520-29951)    | 28383 (27501-32836)    |
-| pread 64k, 8 clients (ops/s)             | 69914 (68776-71080)    | 67428 (66363-69508)    |
-| read 128k with `reply.data()` (MB/s)     | 2864 (2073-2962)       | 2514 (2153-2973)       |
-| read 1M with `reply.data()` (MB/s)       | 4241 (3578-4273)       | 3081 (2969-3219)       |
+| read 4k (MB/s)                           | 161 (152-167)          | 179 (176-183)          |
+| write 4k (MB/s)                          | 137 (135-156)          | 174 (162-190)          |
+| read 128k (MB/s)                         | 2639 (1860-2704)       | 2716 (2599-3235)       |
+| write 128k (MB/s)                        | 917 (904-951)          | 1151 (1076-1195)       |
+| read 1M (MB/s)                           | 4000 (3535-4016)       | 4035 (3947-4095)       |
+| write 1M (MB/s)                          | 1140 (1107-1186)       | 1354 (1283-1399)       |
+| stat, lookup+getattr, 1 client (ops/s)   | 20515 (20056-21476)    | 22441 (22201-22907)    |
+| stat, lookup+getattr, 8 clients (ops/s)  | 131262 (128350-134115) | 133278 (122921-140303) |
+| pread 4k, 1 client (ops/s)               | 37782 (36001-45998)    | 43619 (42411-47581)    |
+| pread 4k, 8 clients (ops/s)              | 212283 (208537-216312) | 246206 (230713-256191) |
+| pread 64k, 1 client (ops/s)              | 27801 (25529-29444)    | 28097 (27503-30057)    |
+| pread 64k, 8 clients (ops/s)             | 70505 (69296-72207)    | 69820 (69040-70962)    |
+| read 128k with `reply.data()` (MB/s)     | 2010 (1941-2151)       | 2591 (2412-2742)       |
+| read 1M with `reply.data()` (MB/s)       | 4226 (3285-4353)       | 3098 (3051-3507)       |
 
-Counting a row as a win only when the two spreads are disjoint: io_uring wins 4k reads, 4k and 128k writes and single-client 4k `pread`; `/dev/fuse` wins 8-client `stat`; the 128k and 1M reads, 1M writes, single-client `stat`, 8-client 4k `pread` and both 64k `pread` rows overlap. Several rows move between "overlap" and "win" from run to run: the `/dev/fuse` 128k read is bimodal on this host (about 1900 or 2900 MB/s depending on the run), `write 1M` and 8-client 4k `pread` came out as 15-17% io_uring wins in a later 3-rep run, and in an earlier 7-rep run both 64k `pread` rows were `/dev/fuse` wins while 8-client `stat` overlapped. Each `stat` is a lookup plus a getattr because the entry TTL is zero. `reply.fill()` writes the data into the ring entry over io_uring, which is where the 1M `reply.data()` row loses about a fifth; over `/dev/fuse` `fill` writes into a fresh heap buffer that is then sent, the same work as `data()`, and the two agree within the spread.
+Counting a row as a win only when the two spreads are disjoint: io_uring wins 4k reads, 4k, 128k and 1M writes, single-client `stat`, 8-client 4k `pread` and the 128k `reply.data()` read; `/dev/fuse` wins no row in this run; the 128k and 1M reads, 8-client `stat`, single-client 4k `pread` and both 64k `pread` rows overlap. The 1M `reply.data()` read also counts as an overlap, but only through the single lowest `/dev/fuse` rep (3285): on medians io_uring loses it by about a quarter. Several rows move between "overlap" and "win" from run to run: the `/dev/fuse` 128k read is bimodal on this host (about 1900 or 2600-3000 MB/s depending on the run, which is why its two rows differ); the 8-client `stat` io_uring spread is 13-16% wide in every run, with a low tail around 122-124k ops/s against a 4-5% `/dev/fuse` spread, so its parity is on the median only; the 8-client 64k `pread` row came out as a small `/dev/fuse` win in a later 3-rep run; and in an earlier 7-rep run 8-client `stat` was a `/dev/fuse` win and the 1M `reply.data()` read an io_uring loss. Each `stat` is a lookup plus a getattr because the entry TTL is zero. `reply.fill()` writes the data into the ring entry over io_uring, which is where the 1M `reply.data()` row loses against `fill`; over `/dev/fuse` `fill` writes into a fresh heap buffer that is then sent, the same work as `data()`, and the two agree within the spread.
 
 ## To Do
 

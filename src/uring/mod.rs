@@ -4,7 +4,9 @@
 //! ring. The kernel fills an entry with a request and posts a CQE; the reply is written into the
 //! same entry and committed with `COMMIT_AND_FETCH`, which re-arms the entry. Every SQE of a ring
 //! is submitted by that ring's own thread, because the kernel delivers the next request into an
-//! entry as task work of the task that submitted the entry's SQE.
+//! entry as task work of the task that submitted the entry's SQE; the ring is created
+//! `SINGLE_ISSUER | DEFER_TASKRUN` so that task work runs inside that thread's own
+//! `io_uring_enter` rather than being signalled to it.
 
 pub(crate) mod mem;
 pub(crate) mod ring;
