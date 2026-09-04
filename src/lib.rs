@@ -106,9 +106,6 @@ mod request_param;
 mod session;
 mod time;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-// Self-removing once a production caller exists; the test build covers items unevenly
-#[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))]
-#[cfg_attr(test, allow(dead_code))]
 mod uring;
 
 /// We generally support async reads
@@ -162,7 +159,8 @@ const UNSUPPORTED_CAPABILITIES: InitFlags = ALIASED_UNSUPPORTED_CAPABILITIES
     // Selecting DAX per inode requires FUSE_ATTR_DAX in the flags field of fuse_attr, which
     // fuser sends as padding. Only a DAX-capable transport (virtiofs) advertises this
     .union(InitFlags::FUSE_HAS_INODE_DAX)
-    // The kernel would route requests to io_uring queues that fuser never creates
+    // Only the session may request this (`enable_io_uring`), once the rings the flag commits
+    // the kernel to exist
     .union(InitFlags::FUSE_OVER_IO_URING)
     // Announces that the filesystem copes with requests the kernel resends. fuser cannot send
     // the FUSE_NOTIFY_RESEND notification that asks for a resend in the first place
@@ -583,6 +581,12 @@ impl KernelConfig {
         }
         self.requested |= capabilities_to_add;
         Ok(())
+    }
+
+    /// Requests `FUSE_OVER_IO_URING`; `add_capabilities` keeps refusing the bit.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub(crate) fn enable_io_uring(&mut self) {
+        self.requested |= InitFlags::FUSE_OVER_IO_URING;
     }
 
     /// Set the maximum number of pending background requests. Such as readahead requests.
@@ -1687,6 +1691,66 @@ mod tests {
             config.requested,
             before | InitFlags::FUSE_HANDLE_KILLPRIV_V2 | InitFlags::FUSE_POSIX_ACL
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    fn enable_io_uring_is_echoed_only_when_offered() {
+        use zerocopy::IntoBytes;
+
+        use crate::ll::fuse_abi::{fuse_in_header, fuse_init_in, fuse_opcode};
+        use crate::uring::staging::test::in_header;
+
+        let init_request = |flags: InitFlags| -> Vec<u8> {
+            let (flags_lo, flags_hi) = (flags | InitFlags::FUSE_INIT_EXT).pair();
+            let len = (size_of::<fuse_in_header>() + size_of::<fuse_init_in>()) as u32;
+            let header = in_header(len, fuse_opcode::FUSE_INIT as u32, 1);
+            let arg = fuse_init_in {
+                major: 7,
+                minor: 45,
+                max_readahead: 65536,
+                flags: flags_lo,
+                flags2: flags_hi,
+                unused: [0; 11],
+            };
+            [&header[..], arg.as_bytes()].concat()
+        };
+        let flags2_of = |request: &[u8], enable: bool| -> u32 {
+            let request = ll::AnyRequest::try_from(request).unwrap();
+            let ll::Operation::Init(init) = request.operation().unwrap() else {
+                panic!("not an init request");
+            };
+            let mut config = KernelConfig::new(
+                init.capabilities(),
+                init.max_readahead(),
+                init.version(),
+                false,
+                SessionACL::Owner,
+            );
+            assert_eq!(
+                config.add_capabilities(InitFlags::FUSE_OVER_IO_URING),
+                Err(InitFlags::FUSE_OVER_IO_URING)
+            );
+            if enable {
+                config.enable_io_uring();
+                assert!(config.requested.contains(InitFlags::FUSE_OVER_IO_URING));
+            }
+            let response = init.reply(&config);
+            ll::reply::Response::with_iovec(&response, request.unique(), |iov| {
+                let bytes: Vec<u8> = iov.iter().flat_map(|s| s.iter().copied()).collect();
+                // fuse_out_header (16) then fuse_init_out; flags2 is at offset 32 of the latter
+                u32::from_ne_bytes(bytes[16 + 32..16 + 36].try_into().unwrap())
+            })
+        };
+        let (_, io_uring_hi) = InitFlags::FUSE_OVER_IO_URING.pair();
+        assert_eq!(io_uring_hi, 1 << 9);
+
+        let offered = init_request(InitFlags::FUSE_OVER_IO_URING | InitFlags::FUSE_ASYNC_READ);
+        assert_eq!(flags2_of(&offered, false) & io_uring_hi, 0);
+        assert_eq!(flags2_of(&offered, true) & io_uring_hi, io_uring_hi);
+
+        let not_offered = init_request(InitFlags::FUSE_ASYNC_READ);
+        assert_eq!(flags2_of(&not_offered, true) & io_uring_hi, 0);
     }
 
     #[test]
