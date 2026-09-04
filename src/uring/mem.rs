@@ -89,8 +89,14 @@ impl RingMemory {
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 flags,
-            )?
-        };
+            )
+        }
+        .map_err(|err| {
+            io::Error::new(
+                io::Error::from(err).kind(),
+                format!("reserving {len} bytes for ring buffers failed ({err})"),
+            )
+        })?;
         let mem = Self {
             base: base.cast(),
             len: len.get(),
@@ -148,7 +154,7 @@ pub(crate) mod test {
     pub(crate) fn try_big(entries: usize) -> Option<RingMemory> {
         match RingMemory::new(entries, 1 << 30) {
             Ok(mem) => Some(mem),
-            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+            Err(e) if e.kind() == io::ErrorKind::OutOfMemory => {
                 eprintln!("skipping: cannot reserve {entries} GiB of address space: {e}");
                 None
             }

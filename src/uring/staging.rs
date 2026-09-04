@@ -110,9 +110,12 @@ pub(crate) mod test {
     pub(crate) const GAP: usize = 4096;
     pub(crate) const CAP: usize = 8192;
 
-    /// The parser needs the staged header 8-byte aligned, as the mapping guarantees
+    /// The parser needs the staged header 8-byte aligned, as the mapping guarantees. The
+    /// bytes are only ever reached through `FakeEntry::ptr`
     #[repr(align(8))]
-    struct Stride([u8; GAP + CAP]);
+    struct Stride {
+        _bytes: [u8; GAP + CAP],
+    }
 
     /// A heap stride standing in for one entry of the mapping. Held as a raw pointer so no
     /// reference to the stride exists while the code under test writes through `ptr()`,
@@ -121,7 +124,9 @@ pub(crate) mod test {
 
     impl FakeEntry {
         pub(crate) fn new() -> Self {
-            Self(NonNull::from(Box::leak(Box::new(Stride([0; GAP + CAP])))))
+            Self(NonNull::from(Box::leak(Box::new(Stride {
+                _bytes: [0; GAP + CAP],
+            }))))
         }
 
         pub(crate) fn ptr(&self) -> NonNull<u8> {

@@ -48,7 +48,8 @@ pub(crate) const WAKE: u64 = u64::MAX;
 /// `io_uring_sqe.len` is a `u32` at this byte offset in the uapi layout.
 const SQE_LEN_OFFSET: usize = 24;
 const OUT_HEADER_SZ: usize = size_of::<abi::fuse_out_header>();
-const IORING_MAX_ENTRIES: usize = 32768;
+/// Largest SQ io_uring accepts; the CQ may be twice that.
+pub(crate) const IORING_MAX_ENTRIES: usize = 32768;
 
 /// Called once per fetched request with the commit handle and the contiguous request bytes.
 /// The slice is valid only for the duration of the call.
@@ -165,6 +166,13 @@ struct Live {
     conn_dead: bool,
     /// First unexpected CQE error or submit failure.
     fatal: Option<io::Error>,
+    /// The session is tearing down. The kernel posts no CQE at unmount for an entry held in
+    /// userspace, so a ring whose entries are all held would otherwise never see `conn_dead`.
+    shutdown: bool,
+    /// The session failed before it could serve, so the thread returns instead of draining:
+    /// a connection with unregistered queues blocks its callers, and only cancelling the
+    /// registered commands releases their `/dev/fuse` references so it can abort.
+    abandon: bool,
     /// Set in the same critical section that decides to exit, so a commit either finds it or
     /// is counted in `in_kernel` before the decision.
     exited: bool,
@@ -394,6 +402,7 @@ impl RingCommit {
     }
 
     /// Steps 2 and 4 for an errno reply on an entry that is already `Committing`.
+    #[cfg(test)]
     fn write_errno_and_hand_off(&self, errno: Errno) {
         // SAFETY: the caller made the entry `Committing`, so this thread is its only writer.
         unsafe { self.entry().write_errno(self.commit_id, errno) };
@@ -532,8 +541,8 @@ impl Ring {
             .filter(|n| *n > 0 && u32::try_from(*n).is_ok())
             .ok_or_else(|| io::Error::other("io_uring: invalid entry count"))?;
         let mem = RingMemory::new(n, payload_cap)?;
-        let wake =
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)?;
+        let wake = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .map_err(|err| io::Error::other(format!("creating the wake eventfd failed ({err})")))?;
         let entries = qids
             .iter()
             .flat_map(|&qid| std::iter::repeat_n(qid, depth as usize))
@@ -574,6 +583,8 @@ impl Ring {
                 pending: Vec::new(),
                 conn_dead: false,
                 fatal: None,
+                shutdown: false,
+                abandon: false,
                 exited: false,
             }),
             entries,
@@ -586,6 +597,24 @@ impl Ring {
     /// Address space reserved for the entry buffers.
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.mem.len()
+    }
+
+    /// Tells the ring thread to leave once nothing is pending in the kernel, even while
+    /// requests are still held by userspace. Call after the connection ended: the held
+    /// requests are already aborted kernel-side, and their late commits are dropped.
+    pub(crate) fn shutdown(&self) {
+        self.live.lock().shutdown = true;
+        if let Err(err) = self.wake.write(1) {
+            error!("io_uring: eventfd write failed: {err}");
+        }
+    }
+
+    /// Makes a thread still waiting for its handler return, as a dropped `from_fd` session's
+    /// does, instead of serving until the connection ends. For a session that failed to start,
+    /// mounted or not: a caller blocked in the mount keeps its unmount from ending the
+    /// connection, so the registered commands must be cancelled for it to abort.
+    pub(crate) fn abandon(&self) {
+        self.live.lock().abandon = true;
     }
 
     fn register_sqe(&self, e: &RingEntry) -> squeue::Entry128 {
@@ -624,12 +653,12 @@ impl Ring {
     pub(crate) fn thread_main(
         self: Arc<Ring>,
         mut io: RingIo,
-        go: mpsc::Receiver<bool>,
+        go: mpsc::Receiver<()>,
         registered: mpsc::Sender<io::Result<()>>,
         handler_rx: mpsc::Receiver<Box<dyn FetchHandler>>,
     ) -> io::Result<()> {
         self.ring_thread.set(thread::current().id()).ok();
-        if go.recv() != Ok(true) {
+        if go.recv().is_err() {
             // Nothing was registered, so `in_kernel` is 0 and `Drop` unmaps
             return Ok(());
         }
@@ -648,6 +677,17 @@ impl Ring {
         // Task work for early fetches runs during this recv; their CQEs wait in the CQ
         let mut handler: Box<dyn FetchHandler> = match handler_rx.recv() {
             Ok(h) => h,
+            Err(_) if self.live.lock().abandon => {
+                // As below: only cancelling the commands lets the connection end, since its
+                // unregistered queues keep the callers blocked in the mount
+                debug!(
+                    "io_uring: ring {} abandoning {} registered commands; the session failed \
+                     to start",
+                    self.index,
+                    self.live.lock().in_kernel
+                );
+                return Ok(());
+            }
             Err(_) if self.mounted => {
                 error!(
                     "io_uring: ring {} serving EIO until the connection ends; the session was \
@@ -675,8 +715,8 @@ impl Ring {
             live.exited = true;
         }
         debug!(
-            "io_uring: ring {} exited, in_kernel={}",
-            self.index, live.in_kernel
+            "io_uring: ring {} exited, in_kernel={} outstanding={}",
+            self.index, live.in_kernel, live.outstanding
         );
         match outcome {
             Err(e) => Err(e),
@@ -815,16 +855,19 @@ impl Ring {
     /// Returns `Ok` on a clean drain with `live.exited` set, `Err` when the ring is unusable.
     ///
     /// The ring leaves once nothing is pending in the kernel and either the connection ended
-    /// (requests still held by userspace are stranded by the kernel anyway) or a fatal error
-    /// was recorded and no fetched request is still held, since leaving earlier would drop
-    /// the replies of those requests and hang the applications behind them.
+    /// or the session shut down (requests still held by userspace are stranded by the kernel
+    /// anyway), or a fatal error was recorded and no fetched request is still held, since
+    /// leaving earlier would drop the replies of those requests and hang the applications
+    /// behind them.
     fn serve(self: &Arc<Self>, io: &mut RingIo, handler: &mut dyn FetchHandler) -> io::Result<()> {
         let (mut wake_retried, mut wake_dead) = (false, false);
         loop {
             self.flush_pending(io)?;
             {
                 let mut live = self.live.lock();
-                let drained = live.conn_dead || (live.fatal.is_some() && live.outstanding == 0);
+                let drained = live.conn_dead
+                    || live.shutdown
+                    || (live.fatal.is_some() && live.outstanding == 0);
                 if live.in_kernel == 0 && drained {
                     live.exited = true;
                     return Ok(());
@@ -958,8 +1001,9 @@ impl Ring {
             last == 0 && matches!(-res, libc::EINVAL | libc::EOPNOTSUPP | libc::EFAULT);
         if register_rejected && self.live.lock().fatal.is_none() {
             error!(
-                "io_uring: registration failed ({err}); the kernel reverted this mount to \
-                 /dev/fuse with one reader thread"
+                "io_uring: the kernel rejected the registration of ring {} ({err}); the \
+                 session ends once the ring's entries are back",
+                self.index
             );
         }
         self.retire(e, Some(err));
@@ -1017,14 +1061,14 @@ impl Ring {
             };
             handler.handle(commit, request);
         }
-        // The reply to write now, if dispatch left one behind
-        let reply: Option<Vec<u8>> = {
+        // The reply to write now, if dispatch left one behind, with the commit it answers
+        let reply: Option<(Vec<u8>, u64)> = {
             let mut state = e.state.lock();
             match &mut *state {
-                EntryState::Deferred { bytes, .. } => {
-                    let bytes = std::mem::take(&mut bytes.0);
+                EntryState::Deferred { bytes, commit_id } => {
+                    let reply = (std::mem::take(&mut bytes.0), *commit_id);
                     *state = EntryState::Committing;
-                    Some(bytes)
+                    Some(reply)
                 }
                 EntryState::Dispatching {
                     reply_taken: false, ..
@@ -1035,7 +1079,7 @@ impl Ring {
                         error: 0,
                         unique: commit_id,
                     };
-                    Some(header.as_bytes().to_vec())
+                    Some((header.as_bytes().to_vec(), commit_id))
                 }
                 EntryState::Dispatching {
                     reply_taken: true, ..
@@ -1055,7 +1099,7 @@ impl Ring {
                 ),
             }
         };
-        if let Some(bytes) = reply {
+        if let Some((bytes, commit_id)) = reply {
             let (header, payload) = bytes.split_at(bytes.len().min(OUT_HEADER_SZ));
             // SAFETY: `Committing`, and the request slice is gone.
             unsafe { e.write_reply(commit_id, &[IoSlice::new(header), IoSlice::new(payload)]) };
@@ -1083,7 +1127,7 @@ impl Drop for Ring {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use std::fs::File;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -1294,6 +1338,18 @@ mod test {
         }
     }
 
+    /// A handle whose commit is refused because its entry is no longer held: with `NotConnected`
+    /// once the connection ended, as for a duplicate reply after unmount, else as a duplicate
+    pub(crate) fn refused_commit(conn_dead: bool) -> RingCommit {
+        let ring = fake_ring(1, true);
+        ring.live.lock().conn_dead = conn_dead;
+        RingCommit {
+            ring,
+            idx: 0,
+            commit_id: 7,
+        }
+    }
+
     /// A `Nop` whose CQE carries `res` (`IORING_NOP_INJECT_RESULT`, Linux 6.10+): `nop_flags`
     /// at byte 28, the result in `len` at byte 24. Older kernels ignore both fields
     fn nop_with_result(user_data: u64, res: i32) -> squeue::Entry128 {
@@ -1325,7 +1381,7 @@ mod test {
         thread: thread::JoinHandle<io::Result<()>>,
         handler_tx: mpsc::Sender<Box<dyn FetchHandler>>,
         registered: mpsc::Receiver<io::Result<()>>,
-        go: mpsc::Sender<bool>,
+        go: mpsc::Sender<()>,
     }
 
     fn start(ring: &Arc<Ring>, io: RingIo) -> Started {
@@ -1346,7 +1402,7 @@ mod test {
 
     impl Started {
         fn registered(&self) {
-            self.go.send(true).unwrap();
+            self.go.send(()).unwrap();
             self.registered
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
@@ -1518,7 +1574,7 @@ mod test {
     }
 
     #[test]
-    fn go_false_registers_nothing() {
+    fn dropped_go_registers_nothing() {
         let _serial = UNMAP_CHECK.lock();
         let Some(io) = try_ring_io(8, 16) else { return };
         let Some(ring) = big_ring(2, true) else {
@@ -1526,7 +1582,7 @@ mod test {
         };
         let base = ring.mem.entry(0).as_ptr() as usize;
         let started = start(&ring, io);
-        started.go.send(false).unwrap();
+        drop(started.go);
         started.thread.join().unwrap().unwrap();
         assert!(
             started.registered.try_recv().is_err(),
@@ -1548,6 +1604,25 @@ mod test {
         started.registered();
         drop(started.handler_tx);
         started.thread.join().unwrap().unwrap();
+        assert_eq!(ring.live.lock().in_kernel, 2);
+        drop(ring);
+        assert!(is_mapped(base), "leaked on purpose");
+    }
+
+    /// A mounted session whose start failed after this ring registered: the thread returns
+    /// with the commands still counted, like the `from_fd` arm, rather than draining. No PR 2
+    /// hook can fail another ring's REGISTER submit, so the arm is pinned here
+    #[test]
+    fn failed_start_abandons_a_registered_ring() {
+        let Some(io) = try_ring_io(8, 16) else { return };
+        let ring = fake_ring(2, true);
+        let base = ring.mem.entry(0).as_ptr() as usize;
+        let started = start(&ring, io);
+        started.registered();
+        ring.abandon();
+        drop(started.handler_tx);
+        started.thread.join().unwrap().unwrap();
+        assert!(!ring.live.lock().exited, "serve never ran");
         assert_eq!(ring.live.lock().in_kernel, 2);
         drop(ring);
         assert!(is_mapped(base), "leaked on purpose");
@@ -1784,6 +1859,61 @@ mod test {
         assert_eq!((live.in_kernel, live.outstanding), (0, 0));
         drop(live);
         assert_eq!(state_name(&ring.entries[0]), "Dead");
+    }
+
+    /// With every entry held by userspace nothing in the kernel can ever complete, so only the
+    /// shutdown signal ends the ring; it leaves with the requests still outstanding
+    #[test]
+    fn shutdown_ends_a_ring_whose_entries_are_all_held() {
+        let Some(mut io) = try_ring_io(8, 16) else {
+            return;
+        };
+        let ring = fake_ring(2, true);
+        let held = [fake_dispatched(&ring, 0, 61), fake_dispatched(&ring, 1, 62)];
+        io.push_or_submit(&ring.wake_sqe()).unwrap();
+        let server = {
+            let ring = Arc::clone(&ring);
+            thread::spawn(move || {
+                ring.ring_thread.set(thread::current().id()).ok();
+                let mut handler = |_: RingCommit, _: &[u8]| {};
+                ring.serve(&mut io, &mut handler)
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ring.hooks.exit_checks.load(Ordering::Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "serve never reached the exit test"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!server.is_finished(), "exited with requests outstanding");
+
+        let asked = Instant::now();
+        ring.shutdown();
+        while !server.is_finished() {
+            assert!(
+                asked.elapsed() < Duration::from_secs(2),
+                "exit was not prompt"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        server.join().unwrap().unwrap();
+        let live = ring.live.lock();
+        assert!(live.exited && live.shutdown && !live.conn_dead);
+        assert_eq!((live.in_kernel, live.outstanding), (0, 2));
+        drop(live);
+        // Late replies to the stranded requests are dropped without touching the buffers
+        for commit in &held {
+            let header = ok_header(commit.commit_id);
+            commit.commit(&[IoSlice::new(header.as_bytes())]).unwrap();
+        }
+        assert_eq!(ring.live.lock().outstanding, 0);
+        assert!(ring.live.lock().pending.is_empty());
+        for e in &ring.entries {
+            assert_eq!(state_name(e), "Dead");
+            assert!(header_bytes(e).iter().all(|b| *b == 0));
+        }
     }
 
     /// The remaining 5.11 rows, through CQEs whose results the kernel is told to produce
