@@ -160,6 +160,11 @@ impl RingSet {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn rings(&self) -> &[Arc<Ring>] {
+        &self.rings
+    }
+
     /// Tells every ring thread to leave once its kernel commands completed. Call after the
     /// connection ended, since requests still held by userspace are dropped.
     pub(crate) fn shutdown(&self) {

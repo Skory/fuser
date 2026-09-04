@@ -294,10 +294,26 @@ impl fmt::Debug for RingCommit {
 enum Begun {
     /// The entry is `Committing`; write the buffers and hand off.
     Direct,
-    /// The reply was stored in the entry for the ring thread to write after dispatch.
+    /// The payload is borrowed. The reply given to `begin` was stored in the entry for the
+    /// ring thread to write after dispatch; without one, the caller stages it and commits
+    /// later.
     Deferred,
     /// The ring exited; nothing to do.
     Dropped,
+}
+
+/// Answers `EIO` and re-arms a `Committing` entry if the `fill` closure unwinds, so the
+/// request fails instead of hanging; disarmed with `mem::forget` once the closure returned.
+struct FillGuard<'a>(&'a RingCommit);
+
+impl Drop for FillGuard<'_> {
+    fn drop(&mut self) {
+        warn!(
+            "io_uring: reply closure for unique {} panicked; replying EIO",
+            self.0.commit_id
+        );
+        self.0.write_errno_and_hand_off(Errno::EIO);
+    }
 }
 
 impl RingCommit {
@@ -313,7 +329,8 @@ impl RingCommit {
     /// Protocol step 1. `live` is released before the reply is copied; `state` stays held, and
     /// step 4 re-checks `exited` under both locks. A refused commit is `NotConnected` when the
     /// connection ended (expected after unmount) and `Other` for a duplicate (a filesystem bug).
-    fn begin(&self, iov: &[IoSlice<'_>]) -> io::Result<Begun> {
+    /// `iov` is stashed when the payload is borrowed; `None` leaves the state alone then.
+    fn begin(&self, iov: Option<&[IoSlice<'_>]>) -> io::Result<Begun> {
         let e = self.entry();
         let mut state = e.state.lock();
         let (exited, conn_dead) = {
@@ -346,12 +363,14 @@ impl RingCommit {
                 commit_id,
                 ..
             } if *commit_id == self.commit_id => {
-                let mut bytes = Vec::with_capacity(iov.iter().map(|s| s.len()).sum());
-                iov.iter().for_each(|s| bytes.extend_from_slice(s));
-                *state = EntryState::Deferred {
-                    bytes: ReplyBytes(bytes),
-                    commit_id: self.commit_id,
-                };
+                if let Some(iov) = iov {
+                    let mut bytes = Vec::with_capacity(iov.iter().map(|s| s.len()).sum());
+                    iov.iter().for_each(|s| bytes.extend_from_slice(s));
+                    *state = EntryState::Deferred {
+                        bytes: ReplyBytes(bytes),
+                        commit_id: self.commit_id,
+                    };
+                }
                 Ok(Begun::Deferred)
             }
             _ if conn_dead => Err(io::Error::new(
@@ -374,7 +393,7 @@ impl RingCommit {
             let header = errno_header(self.commit_id, Errno::EINVAL);
             return self.commit(&[IoSlice::new(header.as_bytes())]);
         }
-        if let Begun::Direct = self.begin(iov)? {
+        if let Begun::Direct = self.begin(Some(iov))? {
             // SAFETY: `Committing` makes this thread the only writer; a request slice can
             // only be live if the request had no payload, and it never covers the header
             // or the payload area.
@@ -382,6 +401,80 @@ impl RingCommit {
             self.ring.hand_off(self.entry(), self.commit_id);
         }
         Ok(())
+    }
+
+    /// Commits a reply whose payload `f` writes into the entry's payload buffer itself: `f`
+    /// gets `max_len` zeroed bytes and returns how many it filled. `Ok(None)` means the reply
+    /// is done (written, dropped after ring exit, or `EINVAL` for a `max_len` beyond the
+    /// entry's capacity or a count beyond the buffer, both logged); `Ok(Some(f))` hands the
+    /// closure back because the request's payload is borrowed, and the caller then commits a
+    /// heap buffer through `commit` like any other reply. A panic in `f` answers `EIO` and
+    /// re-arms the entry before it propagates.
+    pub(crate) fn fill<F>(&self, max_len: usize, f: F) -> io::Result<Option<F>>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        let e = self.entry();
+        if max_len > e.payload_cap {
+            error!(
+                "io_uring: reply buffer of {max_len} bytes for unique {} exceeds the {} byte \
+                 payload buffer; replying EINVAL",
+                self.commit_id, e.payload_cap
+            );
+            let header = errno_header(self.commit_id, Errno::EINVAL);
+            return self
+                .commit(&[IoSlice::new(header.as_bytes())])
+                .map(|()| None);
+        }
+        match self.begin(None)? {
+            Begun::Dropped => Ok(None),
+            Begun::Deferred => Ok(Some(f)),
+            Begun::Direct => {
+                #[cfg(test)]
+                self.ring
+                    .hooks
+                    .direct_fills
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let guard = FillGuard(self);
+                // SAFETY: `Committing` makes this thread the only writer, and a request slice
+                // can only be live if the request had no payload, so it ends before the
+                // payload area; `max_len <= payload_cap` keeps the slice inside it.
+                let res = unsafe { e.with_payload(max_len, f) };
+                std::mem::forget(guard);
+                match self.checked(res, max_len) {
+                    Ok(n) => {
+                        let header = abi::fuse_out_header {
+                            len: OUT_HEADER_SZ as u32 + n,
+                            error: 0,
+                            unique: self.commit_id,
+                        };
+                        // SAFETY: as above; `checked` bounded `n` by the payload.
+                        unsafe { e.write_header(header.as_bytes(), n) }
+                    }
+                    // SAFETY: as above.
+                    Err(errno) => unsafe { e.write_errno(self.commit_id, errno) },
+                }
+                self.ring.hand_off(e, self.commit_id);
+                Ok(None)
+            }
+        }
+    }
+
+    /// A `fill` closure's count as the trailer's `payload_sz`; one beyond the buffer, or
+    /// beyond what `fuse_out_header.len` can name, is a caller bug answered with `EINVAL`.
+    fn checked(&self, res: Result<usize, Errno>, len: usize) -> Result<u32, Errno> {
+        let n = res?;
+        u32::try_from(n)
+            .ok()
+            .filter(|sz| n <= len && sz.checked_add(OUT_HEADER_SZ as u32).is_some())
+            .ok_or_else(|| {
+                error!(
+                    "io_uring: reply for unique {} claims {n} bytes in a {len} byte buffer; \
+                     replying EINVAL",
+                    self.commit_id
+                );
+                Errno::EINVAL
+            })
     }
 
     /// Commits an errno reply. Only valid while the entry is `Dispatching` or `Dispatched`;
@@ -402,7 +495,6 @@ impl RingCommit {
     }
 
     /// Steps 2 and 4 for an errno reply on an entry that is already `Committing`.
-    #[cfg(test)]
     fn write_errno_and_hand_off(&self, errno: Errno) {
         // SAFETY: the caller made the entry `Committing`, so this thread is its only writer.
         unsafe { self.entry().write_errno(self.commit_id, errno) };
@@ -461,18 +553,49 @@ impl RingEntry {
             return;
         };
         let base = self.base.0.as_ptr();
-        // SAFETY: the header fits in `in_out` and the payload fits in `payload_cap`; both
-        // ranges lie inside the stride.
+        // SAFETY: the payload fits in `payload_cap`, so every chunk lands inside the stride.
         unsafe {
-            ptr::copy_nonoverlapping(header.as_ptr(), base, OUT_HEADER_SZ);
             let mut off = self.gap;
             for chunk in iov.iter().skip(1) {
                 ptr::copy_nonoverlapping(chunk.as_ptr(), base.add(off), chunk.len());
                 off += chunk.len();
             }
+            self.write_header(header, payload_sz);
+        }
+    }
+
+    /// Writes the out header into `[0, 16)` and the trailer naming `payload_sz` bytes that
+    /// are already in the payload area.
+    ///
+    /// # Safety
+    ///
+    /// As for `write_reply`, and `payload_sz <= payload_cap`.
+    unsafe fn write_header(&self, header: &[u8], payload_sz: u32) {
+        assert_eq!(header.len(), OUT_HEADER_SZ);
+        let base = self.base.0.as_ptr();
+        // SAFETY: the header and the trailer fields lie inside the entry's header area.
+        unsafe {
+            ptr::copy_nonoverlapping(header.as_ptr(), base, OUT_HEADER_SZ);
             ptr::write_unaligned(base.add(FLAGS_OFFSET).cast::<u64>(), 0);
             ptr::write_unaligned(base.add(PAYLOAD_SZ_OFFSET).cast::<u32>(), payload_sz);
         }
+    }
+
+    /// Runs `f` on the first `len` bytes of the payload area, zeroed.
+    ///
+    /// # Safety
+    ///
+    /// As for `write_reply`, `len <= payload_cap`, and no other reference into the payload
+    /// area exists while `f` runs.
+    unsafe fn with_payload<R>(&self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        // SAFETY: `[gap, gap + len)` is inside the stride and, by the caller's guarantee,
+        // aliased by nothing else while the slice is live.
+        let buf = unsafe {
+            let payload = self.base.0.as_ptr().add(self.gap);
+            ptr::write_bytes(payload, 0, len);
+            slice::from_raw_parts_mut(payload, len)
+        };
+        f(buf)
     }
 
     /// # Safety
@@ -592,6 +715,14 @@ impl Ring {
             #[cfg(test)]
             hooks: test::RingHooks::default(),
         }))
+    }
+
+    /// How many `fill` replies were written straight into an entry.
+    #[cfg(test)]
+    pub(crate) fn direct_fills(&self) -> usize {
+        self.hooks
+            .direct_fills
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Address space reserved for the entry buffers.
@@ -1178,6 +1309,8 @@ pub(crate) mod test {
         pub(super) ignored: AtomicUsize,
         /// Passes of `serve` that evaluated the exit test and stayed.
         pub(super) exit_checks: AtomicUsize,
+        /// `fill` replies written straight into an entry, as opposed to handed back.
+        pub(super) direct_fills: AtomicUsize,
     }
 
     impl RingHooks {
@@ -2597,6 +2730,388 @@ pub(crate) mod test {
         *e.state.lock() = EntryState::Dispatched { commit_id: 92 };
         commit.commit_errno(Errno::ENOENT);
         assert_eq!(state_name(e), "Dispatched");
+        *e.state.lock() = EntryState::Dead;
+        ring.live.lock().in_kernel = 0;
+    }
+
+    fn payload_bytes(e: &RingEntry, len: usize) -> &[u8] {
+        // SAFETY: test-owned entry with no command pending.
+        unsafe { slice::from_raw_parts(e.base.0.as_ptr().add(e.gap), len) }
+    }
+
+    /// `(len, error, unique, payload_sz)` of the entry's header
+    fn reply_fields(e: &RingEntry) -> (u32, i32, u64, u32) {
+        let bytes = header_bytes(e);
+        (
+            u32_at(&bytes, 0),
+            u32_at(&bytes, 4) as i32,
+            u64_at(&bytes, 8),
+            u32_at(&bytes, PAYLOAD_SZ_OFFSET),
+        )
+    }
+
+    /// The payload address of an entry, for asserting where a `fill` closure wrote
+    fn payload_addr(e: &RingEntry) -> usize {
+        e.base.0.as_ptr().wrapping_add(e.gap) as usize
+    }
+
+    /// Poisons the first payload bytes, as an earlier request or reply would leave them
+    fn poison_payload(e: &RingEntry) {
+        // SAFETY: test-owned entry, no command pending.
+        unsafe { ptr::write_bytes(e.base.0.as_ptr().add(e.gap), 0xEE, 16) };
+    }
+
+    /// A direct `fill` on a `Dispatched` entry hands the closure the zeroed payload area
+    /// itself and names what it filled; bytes it reported but did not write go out as zeros
+    #[test]
+    fn fill_writes_the_payload_in_place() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        poison_payload(e);
+        let commit = fake_dispatched(&ring, 0, 41);
+        let addr = payload_addr(e);
+        let handed_back = commit
+            .fill(8, |buf| {
+                assert_eq!(buf.len(), 8);
+                assert_eq!(buf, [0; 8]);
+                assert_eq!(
+                    buf.as_ptr() as usize,
+                    addr,
+                    "the buffer is the entry's payload"
+                );
+                buf[..5].copy_from_slice(b"hello");
+                Ok(5)
+            })
+            .unwrap();
+        assert!(handed_back.is_none());
+        assert_eq!(reply_fields(e), (16 + 5, 0, 41, 5));
+        assert_eq!(payload_bytes(e, 5), b"hello");
+        assert_eq!(state_name(e), "Pending");
+        assert_eq!(ring.live.lock().pending, [0]);
+        assert_eq!(ring.live.lock().outstanding, 0);
+        assert_eq!(ring.direct_fills(), 1);
+
+        // Under-reporting the writes leaves zeros, never stale bytes, in the reply
+        poison_payload(e);
+        let commit = fake_dispatched(&ring, 0, 42);
+        commit
+            .fill(8, |buf| {
+                buf[..3].copy_from_slice(b"abc");
+                Ok(8)
+            })
+            .unwrap();
+        assert_eq!(reply_fields(e), (16 + 8, 0, 42, 8));
+        assert_eq!(payload_bytes(e, 8), b"abc\0\0\0\0\0");
+
+        // An empty reply is a valid fill
+        let commit = fake_dispatched(&ring, 0, 43);
+        commit.fill(0, |buf| Ok(buf.len())).unwrap();
+        assert_eq!(reply_fields(e), (16, 0, 43, 0));
+        assert_eq!(ring.direct_fills(), 3);
+        *e.state.lock() = EntryState::Dead;
+        ring.live.lock().in_kernel = 0;
+    }
+
+    /// An errno, a count beyond the buffer and a buffer beyond the entry all become a
+    /// header-only reply without the closure's bytes; a refused entry never runs the closure
+    #[test]
+    fn fill_refusals_are_header_only() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+
+        let commit = fake_dispatched(&ring, 0, 44);
+        commit.fill(8, |_| Err(Errno::ENOENT)).unwrap();
+        assert_eq!(reply_fields(e), (16, -libc::ENOENT, 44, 0), "errno row");
+        assert_eq!(state_name(e), "Pending", "errno row");
+
+        let commit = fake_dispatched(&ring, 0, 45);
+        commit
+            .fill(8, |buf| {
+                buf.fill(0xAA);
+                Ok(9)
+            })
+            .unwrap();
+        assert_eq!(
+            reply_fields(e),
+            (16, -libc::EINVAL, 45, 0),
+            "over-count row"
+        );
+
+        let commit = fake_dispatched(&ring, 0, 46);
+        let handed_back = commit
+            .fill(e.payload_cap + 1, |_| {
+                unreachable!("the buffer was never made")
+            })
+            .unwrap();
+        assert!(handed_back.is_none(), "over-capacity row");
+        assert_eq!(
+            reply_fields(e),
+            (16, -libc::EINVAL, 46, 0),
+            "over-capacity row"
+        );
+        assert_eq!(state_name(e), "Pending", "over-capacity row");
+
+        // The whole capacity is fine
+        let commit = fake_dispatched(&ring, 0, 47);
+        commit.fill(e.payload_cap, |buf| Ok(buf.len())).unwrap();
+        assert_eq!(
+            reply_fields(e),
+            (16 + e.payload_cap as u32, 0, 47, e.payload_cap as u32),
+            "exact-capacity row"
+        );
+
+        // A refused fill never runs the closure
+        *e.state.lock() = EntryState::Pending { commit_id: 47 };
+        let err = commit
+            .fill(8, |_| unreachable!("refused before the closure"))
+            .err()
+            .expect("refused");
+        assert_eq!(err.to_string(), "duplicate reply");
+        *e.state.lock() = EntryState::Dead;
+        ring.live.lock().in_kernel = 0;
+    }
+
+    /// The synchronous READ path: `fill` from inside the handler of a request without
+    /// payload writes straight into the entry while the request slice is live, and the ring
+    /// thread leaves the `Pending` entry alone after dispatch
+    #[test]
+    fn fill_during_dispatch_without_a_payload_is_direct() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        fake_fetch(e, 48, fuse_opcode::FUSE_GETATTR, &[0; 16], &[]);
+        set_in_kernel(&ring, 0, 0);
+        let addr = payload_addr(e);
+        let mut handler = |commit: RingCommit, request: &[u8]| {
+            assert!(matches!(
+                *commit.ring.entries[0].state.lock(),
+                EntryState::Dispatching {
+                    direct_ok: true,
+                    ..
+                }
+            ));
+            let handed_back = commit
+                .fill(8, |buf| {
+                    assert_eq!(buf.as_ptr() as usize, addr, "written in place");
+                    buf[..4].copy_from_slice(b"stat");
+                    Ok(4)
+                })
+                .unwrap();
+            assert!(handed_back.is_none());
+            assert_eq!(state_name(&commit.ring.entries[0]), "Pending");
+            // The request slice ends before the payload area, so it is untouched
+            assert_eq!(request.len(), 40 + 16);
+            assert_eq!(&request[40..], &[0; 16]);
+        };
+        ring.handle_fetch(e, &mut handler);
+        assert_eq!(state_name(e), "Pending");
+        assert_eq!(reply_fields(e), (16 + 4, 0, 48, 4));
+        assert_eq!(payload_bytes(e, 4), b"stat");
+        assert_eq!(ring.direct_fills(), 1);
+        let live = ring.live.lock();
+        assert_eq!((live.in_kernel, live.outstanding), (1, 0));
+        assert_eq!(live.pending, [0]);
+        drop(live);
+        assert_eq!(ring.wake.read(), Err(nix::errno::Errno::EAGAIN));
+        ring.live.lock().in_kernel = 0;
+    }
+
+    /// While the request's payload is borrowed `fill` hands the closure back instead of
+    /// running it, so the request bytes stay intact and the reply the caller then commits
+    /// takes the deferred path; a stale handle is refused without running anything
+    #[test]
+    fn fill_during_dispatch_with_a_borrowed_payload_is_handed_back() {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let ring = fake_ring(1, true);
+            ring.ring_thread.set(thread::current().id()).ok();
+            let e = &ring.entries[0];
+            fake_fetch(e, 51, fuse_opcode::FUSE_LOOKUP, &[], b"hello\0");
+            set_in_kernel(&ring, 0, 0);
+            let mut handler = |commit: RingCommit, request: &[u8]| {
+                let f = commit
+                    .fill(8, |_| unreachable!("not run while the payload is borrowed"))
+                    .unwrap()
+                    .expect("handed back");
+                assert_eq!(state_name(&commit.ring.entries[0]), "Dispatching");
+                assert_eq!(&request[40..], b"hello\0");
+                let _ = f;
+                assert_eq!(ring.direct_fills(), 0);
+                let header = abi::fuse_out_header {
+                    len: 16 + 4,
+                    error: 0,
+                    unique: 51,
+                };
+                commit
+                    .commit(&[IoSlice::new(header.as_bytes()), IoSlice::new(b"abcd")])
+                    .unwrap();
+                assert_eq!(state_name(&commit.ring.entries[0]), "Deferred");
+                assert_eq!(&request[40..], b"hello\0");
+                // A stale handle for an earlier fetch is refused before its closure runs
+                let stale = RingCommit {
+                    ring: Arc::clone(&commit.ring),
+                    idx: 0,
+                    commit_id: 50,
+                };
+                let err = stale
+                    .fill(8, |_| unreachable!("refused before the closure"))
+                    .err()
+                    .expect("refused");
+                assert_eq!(err.to_string(), "duplicate reply");
+            };
+            ring.handle_fetch(e, &mut handler);
+            assert_eq!(state_name(e), "Pending");
+            assert_eq!(reply_fields(e), (16 + 4, 0, 51, 4));
+            assert_eq!(payload_bytes(e, 4), b"abcd");
+            let live = ring.live.lock();
+            assert_eq!((live.in_kernel, live.outstanding), (1, 0));
+            assert_eq!(live.pending, [0]);
+            drop(live);
+            ring.live.lock().in_kernel = 0;
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("handle_fetch deadlocked or panicked");
+    }
+
+    /// The whole reply path on the borrowed side: `ReplyData::fill` runs the handed-back
+    /// closure on the heap and commits the result through the deferred path; if that closure
+    /// panics the reply object's guard commits `EIO` the same way, so the entry is never
+    /// stranded and nothing is written until dispatch returns
+    #[test]
+    fn reply_data_fill_on_a_borrowed_payload_defers_data_and_panics_alike() {
+        use crate::reply::Reply;
+        use crate::reply::ReplyData;
+        use crate::reply::ReplySender;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let ring = fake_ring(1, true);
+            ring.ring_thread.set(thread::current().id()).ok();
+            let e = &ring.entries[0];
+            fake_fetch(e, 52, fuse_opcode::FUSE_LOOKUP, &[], b"hello\0");
+            set_in_kernel(&ring, 0, 0);
+            let addr = payload_addr(e);
+            let mut handler = |commit: RingCommit, request: &[u8]| {
+                let reply: ReplyData =
+                    Reply::new(crate::ll::RequestId(52), ReplySender::Ring(commit.clone()));
+                reply.fill(8, |buf| {
+                    assert_eq!(buf, [0; 8]);
+                    assert_ne!(buf.as_ptr() as usize, addr, "a heap buffer while borrowed");
+                    buf[..4].copy_from_slice(b"abcd");
+                    Ok(4)
+                });
+                assert_eq!(state_name(&commit.ring.entries[0]), "Deferred");
+                assert_eq!(&request[40..], b"hello\0");
+            };
+            ring.handle_fetch(e, &mut handler);
+            assert_eq!(state_name(e), "Pending");
+            assert_eq!(reply_fields(e), (16 + 4, 0, 52, 4));
+            assert_eq!(payload_bytes(e, 4), b"abcd");
+
+            fake_fetch(e, 53, fuse_opcode::FUSE_LOOKUP, &[], b"other\0");
+            *e.state.lock() = EntryState::InKernel { last: 52 };
+            ring.live.lock().pending.clear();
+            let mut handler = |commit: RingCommit, request: &[u8]| {
+                let reply: ReplyData =
+                    Reply::new(crate::ll::RequestId(53), ReplySender::Ring(commit.clone()));
+                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reply.fill(8, |_| -> Result<usize, Errno> {
+                        panic!("deliberate panic in a fill closure")
+                    })
+                }));
+                assert!(unwound.is_err());
+                assert_eq!(state_name(&commit.ring.entries[0]), "Deferred");
+                assert_eq!(&request[40..], b"other\0");
+                // The guard's EIO is the one reply; a second one is refused
+                let err = commit.fill(8, |_| Ok(0)).err().expect("refused");
+                assert_eq!(err.to_string(), "duplicate reply");
+            };
+            ring.handle_fetch(e, &mut handler);
+            assert_eq!(state_name(e), "Pending");
+            assert_eq!(reply_fields(e), (16, -libc::EIO, 53, 0));
+            let live = ring.live.lock();
+            assert_eq!((live.in_kernel, live.outstanding), (1, 0));
+            assert_eq!(live.pending, [0]);
+            drop(live);
+            assert_eq!(ring.direct_fills(), 0);
+            ring.live.lock().in_kernel = 0;
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("handle_fetch deadlocked or panicked");
+    }
+
+    /// A closure that unwinds mid-fill leaves the entry `Pending` with an EIO header, queued
+    /// for the ring thread, and a later errno commit for the same fetch is refused as a
+    /// duplicate without touching the buffers
+    #[test]
+    fn fill_panic_answers_eio_and_rearms_the_entry() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        let commit = fake_dispatched(&ring, 0, 61);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commit.fill(8, |buf| -> Result<usize, Errno> {
+                buf.fill(0xAB);
+                panic!("deliberate panic in a fill closure")
+            })
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(reply_fields(e), (16, -libc::EIO, 61, 0));
+        assert_eq!(state_name(e), "Pending");
+        let live = ring.live.lock();
+        assert_eq!((live.in_kernel, live.outstanding), (1, 0));
+        assert_eq!(live.pending, [0]);
+        drop(live);
+        let header = header_bytes(e);
+        commit.commit_errno(Errno::EIO);
+        assert_eq!(header_bytes(e), header);
+        assert_eq!(state_name(e), "Pending");
+        assert_eq!(ring.live.lock().pending, [0]);
+        *e.state.lock() = EntryState::Dead;
+        ring.live.lock().in_kernel = 0;
+    }
+
+    /// A fill from a thread other than the ring's writes directly and wakes the ring thread,
+    /// and so does the guard when such a closure panics
+    #[test]
+    fn fill_from_a_foreign_thread_wakes_the_ring() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        let commit = fake_dispatched(&ring, 0, 71);
+        thread::spawn(move || {
+            commit
+                .fill(4, |buf| {
+                    buf.copy_from_slice(b"wxyz");
+                    Ok(4)
+                })
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(reply_fields(e), (16 + 4, 0, 71, 4));
+        assert_eq!(payload_bytes(e, 4), b"wxyz");
+        assert_eq!(state_name(e), "Pending");
+        assert_eq!(ring.wake.read(), Ok(1));
+
+        let commit = fake_dispatched(&ring, 0, 72);
+        let unwound = thread::spawn(move || {
+            commit.fill(4, |_| -> Result<usize, Errno> {
+                panic!("deliberate panic in a fill closure")
+            })
+        })
+        .join();
+        assert!(unwound.is_err());
+        assert_eq!(reply_fields(e), (16, -libc::EIO, 72, 0));
+        assert_eq!(state_name(e), "Pending");
+        assert_eq!(ring.live.lock().pending, [0, 0]);
+        assert_eq!(ring.wake.read(), Ok(1), "the guard woke the ring thread");
         *e.state.lock() = EntryState::Dead;
         ring.live.lock().in_kernel = 0;
     }
