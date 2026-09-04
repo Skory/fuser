@@ -159,6 +159,11 @@ impl RingSet {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn rings(&self) -> &[Arc<Ring>] {
+        &self.rings
+    }
+
     /// `Ring::shutdown` for every ring; call after the connection ended.
     pub(crate) fn shutdown(&self) {
         for ring in &self.rings {
