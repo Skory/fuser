@@ -1,6 +1,15 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add `Config::io_uring` and `Config::io_uring_queue_depth` (default 8), which serve the
+  session over FUSE-over-io_uring instead of `/dev/fuse` reads and writes. This needs the
+  `io-uring` cargo feature, Linux 6.14 or later and the fuse module parameter
+  `enable_uring=Y`; when the kernel does not offer it, or the rings cannot be set up, the
+  session logs a warning and uses `/dev/fuse` as before. Setting `io_uring` in a build without
+  the feature, or on another OS, makes `Session::new` and `Session::from_fd` fail rather than
+  silently ignore it. `clone_fd` has no effect in this mode
+* `Config { n_threads: Some(0), .. }` is refused by `Session::new` and `Session::from_fd` with
+  `InvalidInput`, instead of by `Session::run`
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap
