@@ -7,6 +7,8 @@ use std::fmt;
 pub(crate) enum Feature {
     /// Experimental async API.
     Experimental,
+    /// FUSE-over-io_uring transport.
+    IoUring,
     /// Use libfuse2 for mounting.
     Libfuse2,
     /// Use libfuse3 for mounting.
@@ -18,6 +20,7 @@ impl Feature {
     fn as_str(&self) -> &'static str {
         match self {
             Feature::Experimental => "experimental",
+            Feature::IoUring => "io-uring",
             Feature::Libfuse2 => "libfuse2",
             Feature::Libfuse3 => "libfuse3",
         }

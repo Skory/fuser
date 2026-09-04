@@ -28,6 +28,8 @@ ENV PATH=/root/.cargo/bin:$PATH
 RUN mkdir -p /code && cd /code && git clone https://github.com/fleetfs/fuse-xfstests && cd fuse-xfstests \
   && git checkout fleetfs-xfs-v2026.03.20 && make
 
+ARG BUILD_FEATURES
+
 ADD . /code/fuser/
 
-RUN cd /code/fuser && cargo build --release --examples && cp target/release/examples/simple /bin/fuser
+RUN cd /code/fuser && cargo build --release --examples $BUILD_FEATURES && cp target/release/examples/simple /bin/fuser
