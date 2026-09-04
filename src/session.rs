@@ -314,9 +314,7 @@ impl<FS: Filesystem> Session<FS> {
         }
         channels.push(ch);
 
-        let mut threads = Vec::with_capacity(n_threads);
-
-        for (i, ch) in channels.into_iter().enumerate() {
+        let threads = spawn_named(channels.into_iter().enumerate().map(|(i, ch)| {
             let thread_name = format!("fuser-{i}");
             let event_loop = SessionEventLoop {
                 thread_name: thread_name.clone(),
@@ -328,29 +326,15 @@ impl<FS: Filesystem> Session<FS> {
                 kernel_capabilities,
                 kernel_abi: proto_version,
             };
-            threads.push(
-                thread::Builder::new()
-                    .name(thread_name)
-                    .spawn(move || event_loop.event_loop())?,
-            );
-        }
+            (thread_name, move || event_loop.event_loop())
+        }))?;
 
-        let mut reply: io::Result<()> = Ok(());
-        for thread in threads {
-            let res = match thread.join() {
-                Ok(res) => res,
-                Err(_) => {
-                    return Err(io::Error::other("event loop thread panicked"));
-                }
-            };
-            if let Err(e) = res {
-                if reply.is_ok() {
-                    reply = Err(e);
-                }
-            }
-        }
+        let reply = join_all(threads);
 
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
+            // Only a panic ends the join early; the threads still running hold references
+            // and destroy runs when the last of them exits
+            reply?;
             return Err(io::Error::other(
                 "BUG: must have one refcount for filesystem",
             ));
@@ -538,6 +522,45 @@ impl<FS: Filesystem> Session<FS> {
     }
 }
 
+/// Spawns each `(name, body)` as a thread of that name, in order.
+///
+/// A spawn failure returns its error at once; the threads spawned before it keep running
+/// detached.
+fn spawn_named<F>(
+    threads: impl IntoIterator<Item = (String, F)>,
+) -> io::Result<Vec<JoinHandle<io::Result<()>>>>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    threads
+        .into_iter()
+        .map(|(name, body)| thread::Builder::new().name(name).spawn(body))
+        .collect()
+}
+
+/// Joins every thread in order and returns the first error any of them returned; later errors
+/// are dropped.
+///
+/// A panicked thread ends the join at once with an error, leaving the threads after it
+/// detached.
+fn join_all(threads: impl IntoIterator<Item = JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    let mut reply: io::Result<()> = Ok(());
+    for thread in threads {
+        let res = match thread.join() {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(io::Error::other("event loop thread panicked"));
+            }
+        };
+        if let Err(e) = res {
+            if reply.is_ok() {
+                reply = Err(e);
+            }
+        }
+    }
+    reply
+}
+
 #[derive(Debug)]
 /// A thread-safe object that can be used to unmount a Filesystem
 pub struct SessionUnmounter {
@@ -577,7 +600,8 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive_retrying(buf) {
                 Ok(size) => {
-                    match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
+                    let sender = ReplySender::Channel(self.ch.sender());
+                    match RequestWithSender::new(sender, &buf[..size], self.negotiated) {
                         // Dispatch request
                         Some(req) => {
                             if let Ok(Operation::Destroy(_)) = req.request.operation() {
@@ -717,6 +741,72 @@ impl Drop for BackgroundSession {
         if let Err(err) = self.join_impl() {
             warn!("Session ended with an error during drop: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod thread_test {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Distinct closures have distinct types, so a mixed list needs boxing
+    type Body = Box<dyn FnOnce() -> io::Result<()> + Send>;
+
+    #[test]
+    fn join_all_reports_the_first_error_after_joining_every_thread() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let body = |result: io::Result<()>, delay: u64| -> Body {
+            let done = done.clone();
+            Box::new(move || {
+                thread::sleep(Duration::from_millis(delay));
+                done.fetch_add(1, Ordering::SeqCst);
+                result
+            })
+        };
+        let mut threads = spawn_named([
+            ("a".to_string(), body(Err(io::Error::other("first")), 0)),
+            ("b".to_string(), body(Err(io::Error::other("second")), 50)),
+            ("c".to_string(), body(Ok(()), 0)),
+        ])
+        .unwrap();
+        threads.push(thread::spawn(body(
+            Err(io::Error::other("pre-spawned")),
+            100,
+        )));
+
+        let err = join_all(threads).unwrap_err();
+        assert_eq!(err.to_string(), "first");
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            4,
+            "every thread must be joined"
+        );
+    }
+
+    #[test]
+    fn join_all_reports_a_panic() {
+        let threads = spawn_named([("p".to_string(), || -> io::Result<()> {
+            panic!("deliberate panic from a test thread")
+        })])
+        .unwrap();
+        let err = join_all(threads).unwrap_err();
+        assert_eq!(err.to_string(), "event loop thread panicked");
+    }
+
+    #[test]
+    fn spawn_named_names_the_threads() {
+        let threads = spawn_named([("fuser-99".to_string(), || {
+            if thread::current().name() == Some("fuser-99") {
+                Ok(())
+            } else {
+                Err(io::Error::other("wrong thread name"))
+            }
+        })])
+        .unwrap();
+        join_all(threads).unwrap();
     }
 }
 
@@ -1657,6 +1747,47 @@ mod test {
         // the session
         drop(busy);
         runner.join().unwrap().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// A panic in a filesystem callback ends the session with an error, and the filesystem
+    /// is still destroyed exactly once and unmounted.
+    #[test]
+    fn panic_in_callback_ends_the_session() {
+        struct PanicFs(Arc<std::sync::atomic::AtomicUsize>);
+        impl Filesystem for PanicFs {
+            fn getattr(
+                &self,
+                _req: &Request,
+                _ino: crate::INodeNo,
+                _fh: Option<crate::FileHandle>,
+                _reply: crate::ReplyAttr,
+            ) {
+                panic!("deliberate panic from a test filesystem's getattr()");
+            }
+            fn destroy(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+        let destroyed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let session =
+            Session::new(PanicFs(destroyed.clone()), &mountpoint, &Config::default()).unwrap();
+        let runner = std::thread::spawn(move || session.run());
+        // The dropped reply answers with EIO, so this returns once the panic has happened
+        assert!(std::fs::metadata(&mountpoint).is_err());
+
+        let err = runner.join().unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "event loop thread panicked");
+        assert_eq!(destroyed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        assert!(
+            !mounts
+                .lines()
+                .any(|l| l.split(' ').nth(1) == mountpoint.to_str())
+        );
         ManuallyDrop::into_inner(tmp);
     }
 
