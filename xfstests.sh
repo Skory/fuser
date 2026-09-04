@@ -200,7 +200,28 @@ echo "generic/208" >> xfs_excludes.txt
 echo "generic/323" >> xfs_excludes.txt
 
 
-FUSER_EXTRA_MOUNT_OPTIONS="--auto-unmount --dev" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" \
+# check-fuser runs fuser at the default log level, which cannot show the ring-ready line, so
+# a ring run is proven on a short debug-level mount first; a silent fallback must not pass
+if [ -n "$FUSER_URING_FLAGS" ]; then
+  PROBE_DATA_DIR=$(mktemp --directory)
+  PROBE_DIR=$(mktemp --directory)
+  fuser -vvv --auto-unmount --data-dir "$PROBE_DATA_DIR" --mount-point "$PROBE_DIR" $FUSER_URING_FLAGS > /code/logs/uring_probe.log 2>&1 &
+  PROBE_PID=$!
+  # Requests block until the queues are registered, so the line is there once the mount has
+  # answered mountpoint's stat. A mount that still does not answer after the deadline is a
+  # registered ring that never serves, and fails the run like a missing line does
+  DEADLINE=$((SECONDS + 30))
+  while [ $SECONDS -lt $DEADLINE ] && kill -0 $PROBE_PID 2> /dev/null && ! timeout 30 mountpoint -q "$PROBE_DIR"; do
+    sleep 0.05
+  done
+  timeout 30 mountpoint -q "$PROBE_DIR" && grep 'io_uring: ring [0-9]* registered' /code/logs/uring_probe.log \
+    || { kill $PROBE_PID 2> /dev/null || true; export XFSTESTS_EXIT_STATUS=1; exit 1; }
+  umount "$PROBE_DIR"
+  wait $PROBE_PID
+  rm -rf "$PROBE_DIR" "$PROBE_DATA_DIR"
+fi
+
+FUSER_EXTRA_MOUNT_OPTIONS="--auto-unmount --dev $FUSER_URING_FLAGS" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" \
 ./check-fuser -E xfs_excludes.txt "$@" \
 | tee /code/logs/xfstests.log
 
