@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         libfuse: [libfuse-dev, libfuse3-dev]
-        features: [ '' ]
+        features: [ '', 'io-uring' ]
 
     env:
       RUSTFLAGS: --deny warnings
