@@ -15,7 +15,6 @@ use crate::Filesystem;
 use crate::Owner;
 use crate::PollNotifier;
 use crate::Request;
-use crate::channel::ChannelSender;
 use crate::forget_one::ForgetOne;
 use crate::ll;
 use crate::ll::Errno;
@@ -34,8 +33,8 @@ use crate::session::SessionEventLoop;
 /// Request data structure
 #[derive(Debug)]
 pub(crate) struct RequestWithSender<'a> {
-    /// Channel sender for sending the reply
-    ch: ChannelSender,
+    /// Prototype cloned into every reply object created for this request
+    sender: ReplySender,
     /// Parsed request
     pub(crate) request: ll::AnyRequest<'a>,
     /// The header as the filesystem sees it, where that differs from the one on the wire.
@@ -52,7 +51,7 @@ pub(crate) struct RequestWithSender<'a> {
 impl<'a> RequestWithSender<'a> {
     /// Create a new request from the given data
     pub(crate) fn new(
-        ch: ChannelSender,
+        sender: ReplySender,
         data: &'a [u8],
         negotiated: InitFlags,
     ) -> Option<RequestWithSender<'a>> {
@@ -75,7 +74,7 @@ impl<'a> RequestWithSender<'a> {
                 });
 
         Some(Self {
-            ch,
+            sender,
             request,
             masked_header,
         })
@@ -343,11 +342,7 @@ impl<'a> RequestWithSender<'a> {
                     self.request.nodeid(),
                     x.file_handle(),
                     x.offset(),
-                    ReplyDirectory::new(
-                        self.request.unique(),
-                        ReplySender::Channel(self.ch.clone()),
-                        x.size() as usize,
-                    ),
+                    ReplyDirectory::new(self.request.unique(), self.sender(), x.size() as usize),
                 );
             }
             ll::Operation::ReleaseDir(x) => {
@@ -535,7 +530,7 @@ impl<'a> RequestWithSender<'a> {
                     x.offset(),
                     ReplyDirectoryPlus::new(
                         self.request.unique(),
-                        ReplySender::Channel(self.ch.clone()),
+                        self.sender(),
                         x.size() as usize,
                     ),
                 );
@@ -668,7 +663,11 @@ impl<'a> RequestWithSender<'a> {
     }
 
     pub(crate) fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique(), ReplySender::Channel(self.ch.clone()))
+        Reply::new(self.request.unique(), self.sender())
+    }
+
+    fn sender(&self) -> ReplySender {
+        self.sender.clone()
     }
 
     /// Returns a Request reference for this request
