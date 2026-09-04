@@ -863,3 +863,213 @@ pub(crate) struct fuse_copy_file_range_in {
     pub(crate) len: u64,
     pub(crate) flags: u64,
 }
+
+/// Size of the `in_out` area of `fuse_uring_req_header`. Since ABI 7.42
+pub(crate) const FUSE_URING_IN_OUT_HEADER_SZ: usize = 128;
+/// Size of the `op_in` area of `fuse_uring_req_header`. Since ABI 7.42
+pub(crate) const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
+
+/// Commands carried in `io_uring_sqe.cmd_op` for `IORING_OP_URING_CMD` on `/dev/fuse`.
+/// Since ABI 7.42. 7.46 adds `ADD_QUEUE = 3` and `ADD_BUFPOOL = 4`, not declared here
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
+#[allow(non_camel_case_types)]
+pub(crate) enum fuse_uring_cmd {
+    FUSE_IO_URING_CMD_INVALID = 0,
+    FUSE_IO_URING_CMD_REGISTER = 1,
+    FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+}
+
+/// Trailer of `fuse_uring_req_header`, written by the kernel on fetch and by userspace on
+/// commit. Since ABI 7.42. `padding` becomes `offset` in 7.46 and must be sent as zero
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_ent_in_out {
+    pub(crate) flags: u64,
+    /// The request's `unique`, echoed in `fuse_uring_cmd_req.commit_id`
+    pub(crate) commit_id: u64,
+    /// Bytes valid in the payload buffer, in either direction
+    pub(crate) payload_sz: u32,
+    pub(crate) padding: u32,
+    pub(crate) reserved: u64,
+}
+
+/// Per-entry header buffer, `iov[0]` of a REGISTER. Since ABI 7.42
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_req_header {
+    /// `fuse_in_header` on fetch, `fuse_out_header` on commit
+    pub(crate) in_out: [u8; FUSE_URING_IN_OUT_HEADER_SZ],
+    /// The fixed per-opcode in-struct (`in_args[0]`); unused on commit
+    pub(crate) op_in: [u8; FUSE_URING_OP_IN_OUT_SZ],
+    pub(crate) ring_ent_in_out: fuse_uring_ent_in_out,
+}
+
+/// The command data in the 80-byte area of an SQE128. Since ABI 7.42. 7.46 grows this to
+/// 40 bytes with a trailing union; the rest of the 80-byte cmd area must be zero
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_cmd_req {
+    pub(crate) flags: u64,
+    /// 0 for REGISTER
+    pub(crate) commit_id: u64,
+    pub(crate) qid: u16,
+    pub(crate) padding: [u8; 6],
+}
+
+#[cfg(test)]
+mod test {
+    use std::mem::offset_of;
+
+    use super::*;
+
+    #[test]
+    fn uring_ent_in_out_layout() {
+        assert_eq!(size_of::<fuse_uring_ent_in_out>(), 32);
+        assert_eq!(align_of::<fuse_uring_ent_in_out>(), align_of::<u64>());
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, flags), 0);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, commit_id), 8);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, payload_sz), 16);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, padding), 20);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, reserved), 24);
+    }
+
+    #[test]
+    fn uring_req_header_layout() {
+        assert_eq!(size_of::<fuse_uring_req_header>(), 288);
+        assert_eq!(align_of::<fuse_uring_req_header>(), align_of::<u64>());
+        assert_eq!(offset_of!(fuse_uring_req_header, in_out), 0);
+        assert_eq!(offset_of!(fuse_uring_req_header, op_in), 128);
+        assert_eq!(offset_of!(fuse_uring_req_header, ring_ent_in_out), 256);
+    }
+
+    #[test]
+    fn uring_cmd_req_layout() {
+        assert_eq!(size_of::<fuse_uring_cmd_req>(), 24);
+        assert_eq!(align_of::<fuse_uring_cmd_req>(), align_of::<u64>());
+        assert_eq!(offset_of!(fuse_uring_cmd_req, flags), 0);
+        assert_eq!(offset_of!(fuse_uring_cmd_req, commit_id), 8);
+        assert_eq!(offset_of!(fuse_uring_cmd_req, qid), 16);
+        assert_eq!(offset_of!(fuse_uring_cmd_req, padding), 18);
+    }
+
+    #[test]
+    fn uring_cmd_req_round_trip() {
+        let req = fuse_uring_cmd_req {
+            flags: 0x0102_0304_0506_0708,
+            commit_id: 0x1112_1314_1516_1718,
+            qid: 0x2122,
+            padding: [0x31, 0x32, 0x33, 0x34, 0x35, 0x36],
+        };
+        let bytes = req.as_bytes();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[..8], &0x0102_0304_0506_0708u64.to_ne_bytes());
+        assert_eq!(&bytes[8..16], &0x1112_1314_1516_1718u64.to_ne_bytes());
+        assert_eq!(&bytes[16..18], &0x2122u16.to_ne_bytes());
+        assert_eq!(&bytes[18..], &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36]);
+        let back = fuse_uring_cmd_req::read_from_bytes(bytes).unwrap();
+        assert_eq!(back.flags, req.flags);
+        assert_eq!(back.commit_id, req.commit_id);
+        assert_eq!(back.qid, req.qid);
+        assert_eq!(back.padding, req.padding);
+    }
+
+    /// The direction the transport reads: a kernel-filled header buffer decodes into the
+    /// `fuse_in_header` at the front and the trailer at 256
+    #[test]
+    fn uring_req_header_read() {
+        let mut bytes = [0u8; 288];
+        bytes[..4].copy_from_slice(&0x0000_0028u32.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&(fuse_opcode::FUSE_GETATTR as u32).to_ne_bytes());
+        bytes[8..16].copy_from_slice(&0x4142_4344_4546_4748u64.to_ne_bytes());
+        bytes[256..264].copy_from_slice(&0x0102_0304_0506_0708u64.to_ne_bytes());
+        bytes[264..272].copy_from_slice(&0x1112_1314_1516_1718u64.to_ne_bytes());
+        bytes[272..276].copy_from_slice(&0x2122_2324u32.to_ne_bytes());
+        bytes[276..280].copy_from_slice(&0x3132_3334u32.to_ne_bytes());
+        bytes[280..288].copy_from_slice(&0x5152_5354_5556_5758u64.to_ne_bytes());
+        let hdr = fuse_uring_req_header::read_from_bytes(&bytes).unwrap();
+        let (in_header, _) = fuse_in_header::read_from_prefix(&hdr.in_out).unwrap();
+        assert_eq!(in_header.len, 0x28);
+        assert_eq!(in_header.opcode, fuse_opcode::FUSE_GETATTR as u32);
+        assert_eq!(in_header.unique, 0x4142_4344_4546_4748);
+        assert_eq!(hdr.ring_ent_in_out.flags, 0x0102_0304_0506_0708);
+        assert_eq!(hdr.ring_ent_in_out.commit_id, 0x1112_1314_1516_1718);
+        assert_eq!(hdr.ring_ent_in_out.payload_sz, 0x2122_2324);
+        assert_eq!(hdr.ring_ent_in_out.padding, 0x3132_3334);
+        assert_eq!(hdr.ring_ent_in_out.reserved, 0x5152_5354_5556_5758);
+        assert_eq!(hdr.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn uring_cmd_values() {
+        use fuse_uring_cmd::*;
+        assert_eq!(size_of::<fuse_uring_cmd>(), 4);
+        assert_eq!(align_of::<fuse_uring_cmd>(), 4);
+        assert_eq!(FUSE_IO_URING_CMD_INVALID as u32, 0);
+        assert_eq!(FUSE_IO_URING_CMD_REGISTER as u32, 1);
+        assert_eq!(FUSE_IO_URING_CMD_COMMIT_AND_FETCH as u32, 2);
+        assert_eq!(fuse_uring_cmd::try_from(0), Ok(FUSE_IO_URING_CMD_INVALID));
+        assert_eq!(fuse_uring_cmd::try_from(1), Ok(FUSE_IO_URING_CMD_REGISTER));
+        assert_eq!(
+            fuse_uring_cmd::try_from(2),
+            Ok(FUSE_IO_URING_CMD_COMMIT_AND_FETCH)
+        );
+        assert_eq!(fuse_uring_cmd::try_from(3).unwrap_err().number, 3);
+        assert!(fuse_uring_cmd::try_from(u32::MAX).is_err());
+    }
+
+    /// The ring places each request's fixed in-struct at `op_in`, and the io_uring transport
+    /// relies on every such struct being a whole number of `u64`s. Every new `*_in` struct
+    /// parsed by `ll::request` belongs in this list
+    #[test]
+    fn fixed_in_structs_are_multiples_of_8() {
+        assert!(size_of::<fuse_in_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
+        assert!(size_of::<fuse_out_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
+        let sizes = [
+            ("fuse_in_header", size_of::<fuse_in_header>()),
+            ("fuse_init_in", size_of::<fuse_init_in>()),
+            ("fuse_forget_in", size_of::<fuse_forget_in>()),
+            ("fuse_batch_forget_in", size_of::<fuse_batch_forget_in>()),
+            ("fuse_getattr_in", size_of::<fuse_getattr_in>()),
+            ("fuse_setattr_in", size_of::<fuse_setattr_in>()),
+            ("fuse_mknod_in", size_of::<fuse_mknod_in>()),
+            ("fuse_mkdir_in", size_of::<fuse_mkdir_in>()),
+            ("fuse_rename_in", size_of::<fuse_rename_in>()),
+            ("fuse_rename2_in", size_of::<fuse_rename2_in>()),
+            ("fuse_link_in", size_of::<fuse_link_in>()),
+            ("fuse_open_in", size_of::<fuse_open_in>()),
+            ("fuse_create_in", size_of::<fuse_create_in>()),
+            ("fuse_release_in", size_of::<fuse_release_in>()),
+            ("fuse_flush_in", size_of::<fuse_flush_in>()),
+            ("fuse_read_in", size_of::<fuse_read_in>()),
+            ("fuse_write_in", size_of::<fuse_write_in>()),
+            ("fuse_fsync_in", size_of::<fuse_fsync_in>()),
+            ("fuse_setxattr_in", size_of::<fuse_setxattr_in>()),
+            ("fuse_getxattr_in", size_of::<fuse_getxattr_in>()),
+            ("fuse_lk_in", size_of::<fuse_lk_in>()),
+            ("fuse_access_in", size_of::<fuse_access_in>()),
+            ("fuse_interrupt_in", size_of::<fuse_interrupt_in>()),
+            ("fuse_bmap_in", size_of::<fuse_bmap_in>()),
+            ("fuse_ioctl_in", size_of::<fuse_ioctl_in>()),
+            ("fuse_poll_in", size_of::<fuse_poll_in>()),
+            ("fuse_fallocate_in", size_of::<fuse_fallocate_in>()),
+            ("fuse_lseek_in", size_of::<fuse_lseek_in>()),
+            (
+                "fuse_copy_file_range_in",
+                size_of::<fuse_copy_file_range_in>(),
+            ),
+            ("fuse_syncfs_in", size_of::<fuse_syncfs_in>()),
+            ("fuse_statx_in", size_of::<fuse_statx_in>()),
+            (
+                "fuse_notify_retrieve_in",
+                size_of::<fuse_notify_retrieve_in>(),
+            ),
+        ];
+        for (name, size) in sizes {
+            assert_eq!(size % 8, 0, "{name} is {size} bytes");
+            assert!(size <= FUSE_URING_OP_IN_OUT_SZ, "{name} is {size} bytes");
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(size_of::<fuse_setxattr_in_ext>() % 8, 0);
+    }
+}
