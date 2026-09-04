@@ -25,6 +25,14 @@ pub struct CommonArgs {
     /// when multiple threads are used. Requires Linux 4.5+.
     #[clap(long)]
     pub clone_fd: bool,
+
+    /// Serve requests over FUSE-over-io_uring (needs the io-uring feature and enable_uring=Y).
+    #[clap(long)]
+    pub io_uring: bool,
+
+    /// Ring entries per kernel queue when `--io-uring` is set
+    #[clap(long, default_value_t = 8)]
+    pub io_uring_queue_depth: u32,
 }
 
 impl CommonArgs {
@@ -43,6 +51,8 @@ impl CommonArgs {
         }
         config.n_threads = Some(self.n_threads);
         config.clone_fd = self.clone_fd;
+        config.io_uring = self.io_uring;
+        config.io_uring_queue_depth = self.io_uring_queue_depth;
         config
     }
 }

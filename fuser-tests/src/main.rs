@@ -19,6 +19,7 @@ use clap::Parser;
 use clap::Subcommand;
 
 use crate::commands::bsd_mount;
+use crate::commands::io_uring;
 use crate::commands::macos_mount;
 use crate::commands::mount;
 use crate::commands::simple;
@@ -35,6 +36,8 @@ struct FuserTests {
 enum FuserCommand {
     /// Run BSD mount tests.
     BsdMount,
+    /// Run Linux FUSE-over-io_uring mount tests.
+    LinuxIoUring,
     /// Run Linux mount tests with libfuse2.
     LinuxMountLibfuse2,
     /// Run Linux mount tests with libfuse3.
@@ -70,6 +73,7 @@ async fn main_inner() -> anyhow::Result<()> {
     let FuserTests { command } = FuserTests::parse();
     match command {
         FuserCommand::BsdMount => bsd_mount::run_bsd_mount_tests().await?,
+        FuserCommand::LinuxIoUring => io_uring::run_io_uring_tests().await?,
         FuserCommand::LinuxMountLibfuse2 => mount::run_mount_tests(Libfuse::Libfuse2).await?,
         FuserCommand::LinuxMountLibfuse3 => mount::run_mount_tests(Libfuse::Libfuse3).await?,
         FuserCommand::MacosMount => macos_mount::run_macos_mount_tests().await?,
