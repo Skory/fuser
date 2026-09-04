@@ -100,6 +100,11 @@ test_passthrough:
 	sudo tests/test_passthrough.sh target/debug/examples/passthrough
 	sudo tests/test_passthrough.sh target/debug/examples/passthrough_fork
 
+# Compares the /dev/fuse and io_uring transports on the host. Unpinned by default; on
+# multi-socket hosts pass --client-cpus/--server-cpus, see README "Benchmarking"
+bench:
+	cargo run --release -p fuser-tests -- transport-bench
+
 test: pre mount_tests pjdfs_tests xfstests
 	cargo test
 
