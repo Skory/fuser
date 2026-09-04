@@ -36,7 +36,7 @@ use crate::ll::{self};
 use crate::passthrough::BackingId;
 
 /// Generic reply callback to send data
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ReplySender {
     Channel(ChannelSender),
     #[cfg(test)]
@@ -84,7 +84,7 @@ impl ReplySender {
 }
 
 #[cfg(test)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AssertSender {
     expected: Vec<u8>,
 }
