@@ -23,6 +23,8 @@ use crate::commands::io_uring;
 use crate::commands::macos_mount;
 use crate::commands::mount;
 use crate::commands::simple;
+use crate::commands::transport_bench;
+use crate::commands::transport_bench::TransportBenchArgs;
 use crate::libfuse::Libfuse;
 
 /// Execute e2e tests for fuser.
@@ -46,6 +48,8 @@ enum FuserCommand {
     MacosMount,
     /// Run simple filesystem tests.
     Simple,
+    /// Benchmark the /dev/fuse and io_uring transports on the host (needs root).
+    TransportBench(TransportBenchArgs),
 }
 
 #[tokio::main]
@@ -61,8 +65,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn main_inner() -> anyhow::Result<()> {
-    // Validate that we're running inside Docker on Linux.
-    if cfg!(target_os = "linux") && std::env::var("FUSER_TESTS_IN_DOCKER").as_deref() != Ok("true")
+    let FuserTests { command } = FuserTests::parse();
+
+    // Validate that we're running inside Docker on Linux. The benchmark is the exception: it
+    // only mounts into a temporary directory, and its numbers are for the host
+    if cfg!(target_os = "linux")
+        && !matches!(command, FuserCommand::TransportBench(_))
+        && std::env::var("FUSER_TESTS_IN_DOCKER").as_deref() != Ok("true")
     {
         bail!(
             "FUSER_TESTS_IN_DOCKER environment variable is not set to 'true'. \
@@ -70,7 +79,6 @@ async fn main_inner() -> anyhow::Result<()> {
         );
     }
 
-    let FuserTests { command } = FuserTests::parse();
     match command {
         FuserCommand::BsdMount => bsd_mount::run_bsd_mount_tests().await?,
         FuserCommand::LinuxIoUring => io_uring::run_io_uring_tests().await?,
@@ -78,6 +86,7 @@ async fn main_inner() -> anyhow::Result<()> {
         FuserCommand::LinuxMountLibfuse3 => mount::run_mount_tests(Libfuse::Libfuse3).await?,
         FuserCommand::MacosMount => macos_mount::run_macos_mount_tests().await?,
         FuserCommand::Simple => simple::run_simple_tests().await?,
+        FuserCommand::TransportBench(args) => transport_bench::run_transport_bench(args).await?,
     }
     Ok(())
 }

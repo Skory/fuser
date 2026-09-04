@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::bail;
 use tempfile::NamedTempFile;
-use tokio::process::Child;
 use tokio::process::Command;
 
 use crate::ansi::green;
@@ -15,14 +14,15 @@ use crate::cargo::cargo_build_example;
 use crate::features::Feature;
 use crate::fusermount::Fusermount;
 use crate::mount_util::wait_for_fuse_mount;
+use crate::unmount::MountGuard;
 use crate::unmount::Unmount;
 use crate::unmount::kill_and_unmount;
 
-const ENABLE_URING: &str = "/sys/module/fuse/parameters/enable_uring";
+pub(crate) const ENABLE_URING: &str = "/sys/module/fuse/parameters/enable_uring";
 const QUEUE_DEPTH: &str = "2";
 
 /// Logged by the session when it stays on `/dev/fuse` although `--io-uring` was set.
-const FALLBACK: &str = "; using /dev/fuse";
+pub(crate) const FALLBACK: &str = "; using /dev/fuse";
 /// The fallback reason when the kernel has FUSE-over-io_uring disabled or predates it.
 const NOT_ADVERTISED: &str = "did not advertise FUSE_OVER_IO_URING";
 /// The fallback reasons when the container runtime refuses the io_uring syscalls: Docker's
@@ -34,47 +34,21 @@ const SETUP_REFUSED: [&str; 2] = [
 /// Suffix of the request debug lines dispatched by a ring thread.
 const RING_THREAD: &str = "thread=fuser-ring-";
 
+/// Whether the fuse module has FUSE-over-io_uring enabled. A missing parameter means the
+/// kernel predates it.
+pub(crate) async fn uring_enabled() -> bool {
+    tokio::fs::read_to_string(ENABLE_URING)
+        .await
+        .map(|value| value.trim() == "Y")
+        .unwrap_or(false)
+}
+
 /// Logged by the session once a ring's queues are registered with the kernel:
 /// `io_uring: ring <index> registered <count> entries`, the line the shell tests grep for too.
 fn is_ring_ready(line: &str) -> bool {
     line.split_once("io_uring: ring ").is_some_and(|(_, rest)| {
         rest.split(' ').nth(1) == Some("registered") && rest.ends_with(" entries")
     })
-}
-
-/// Kills hello and unmounts on every exit path, so a failed run leaves neither a process nor a
-/// disconnected mount behind. Disarmed once `kill_and_unmount` has done both.
-struct MountGuard {
-    child: Option<Child>,
-    mount_path: String,
-}
-
-impl MountGuard {
-    fn disarm(mut self) -> Child {
-        self.child
-            .take()
-            .expect("a MountGuard is disarmed at most once")
-    }
-}
-
-impl Drop for MountGuard {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let _ = child.start_kill();
-        // Closing /dev/fuse aborts the connection and releases requests a reader is stuck in,
-        // which would otherwise make the unmount fail with EBUSY
-        for _ in 0..100 {
-            match child.try_wait() {
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                _ => break,
-            }
-        }
-        let _ = std::process::Command::new("umount")
-            .arg(&self.mount_path)
-            .status();
-    }
 }
 
 /// Mounts `hello --io-uring --io-uring-queue-depth 2` and checks which transport served the
@@ -84,11 +58,7 @@ impl Drop for MountGuard {
 /// capability. Any other fallback reason, a ring run the kernel should not have allowed, or a
 /// read served by the wrong transport fails with the mount log attached.
 pub(crate) async fn run_io_uring_tests() -> anyhow::Result<()> {
-    // A missing parameter means the kernel predates FUSE-over-io_uring
-    let enable_uring = tokio::fs::read_to_string(ENABLE_URING)
-        .await
-        .map(|value| value.trim() == "Y")
-        .unwrap_or(false);
+    let enable_uring = uring_enabled().await;
     eprintln!("enable_uring={enable_uring}");
 
     let log_file = NamedTempFile::new().context("Failed to create log file")?;
@@ -121,10 +91,7 @@ async fn run_io_uring_tests_inner(
         .kill_on_drop(true)
         .spawn()
         .context("Failed to start hello example")?;
-    let guard = MountGuard {
-        child: Some(fuse_process),
-        mount_path: mount_path_str.to_owned(),
-    };
+    let guard = MountGuard::new(fuse_process, mount_path_str);
 
     wait_for_fuse_mount(mount_dir.path()).await?;
 
