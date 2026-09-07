@@ -5,19 +5,80 @@ use std::io::ErrorKind;
 use crate::SessionACL;
 
 /// Fuser session configuration, including mount options.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Config {
     /// Mount options.
     pub mount_options: Vec<MountOption>,
     /// Who can access the filesystem.
     pub acl: SessionACL,
-    /// Number of event loop threads. If unspecified, one thread is used.
+    /// Number of event loop threads, at least 1. If unspecified, one thread is used.
     pub n_threads: Option<usize>,
     /// Use `FUSE_DEV_IOC_CLONE` to give each worker thread its own fd.
     /// This enables more efficient request processing
     /// when multiple threads are used. Requires Linux 4.5+.
     pub clone_fd: bool,
+    /// Serve requests over FUSE-over-io_uring instead of `/dev/fuse` reads and writes.
+    ///
+    /// Needs the `io-uring` cargo feature, Linux 6.14 or later, and the fuse module parameter
+    /// `enable_uring=Y`. When the kernel does not offer it, or `io_uring_setup(2)` or the
+    /// buffer reservation fails, the session logs a warning and uses `/dev/fuse`. Setting this
+    /// without the feature, or on another target, makes `Session::new` and `Session::from_fd`
+    /// fail. Once the kernel has been told to use the rings (in the INIT reply), a failure to
+    /// deliver that reply or to register the queues is an error from the constructor as well.
+    ///
+    /// Up to `n_threads` rings are created, one per worker thread but never more than the
+    /// number of possible CPUs, and the kernel's per-CPU queues are spread round-robin across
+    /// them. A separate thread keeps reading `/dev/fuse` for the requests the kernel never
+    /// sends over the ring (FORGET, INTERRUPT, notify replies), so the filesystem always sees
+    /// at least two dispatching threads: `n_threads = 1` no longer serializes callbacks, and
+    /// `forget` may run concurrently with `lookup` or `release`. `clone_fd` has no effect in
+    /// this mode.
+    ///
+    /// The ring threads are started and the queues are registered with the kernel before
+    /// `Session::new` returns, and from that moment every request on the mount waits for
+    /// `Session::run` or `Session::spawn` to start serving them, so call one of those promptly.
+    /// Replies may be sent from any thread, as on `/dev/fuse`; the replying thread does not
+    /// have to outlive anything.
+    ///
+    /// A panic in a `Filesystem` callback ends the session with an error, as on `/dev/fuse`,
+    /// but the ring threads keep the mount's queues served: the ring whose callback panicked
+    /// answers its requests with `EIO` from then on, while other rings and the `/dev/fuse`
+    /// reader keep dispatching, as the surviving readers of a multi-threaded `/dev/fuse`
+    /// session do. A session made with `Session::spawn` stays mounted in that state until the
+    /// `BackgroundSession` is dropped or unmounted with `umount_and_join`.
+    pub io_uring: bool,
+    /// Entries registered per kernel queue and ring when `io_uring` is set. Default 8, at
+    /// least 1. At most this many requests from one CPU are in flight in the filesystem at a
+    /// time; the kernel queues the rest until an entry is committed, so size it for the
+    /// concurrency of a filesystem that replies asynchronously, not only for memory.
+    ///
+    /// Each entry reserves `PAGE_SIZE + max(8192, max_write, max_pages * PAGE_SIZE)` bytes of
+    /// address space, where `max_write` and `max_pages` are what `Filesystem::init` negotiated
+    /// (`KernelConfig::set_max_write`); with fuser's default 16 MiB `max_write` that is about
+    /// 16 MiB per entry, times this depth, times the number of possible CPUs. The memory is
+    /// reserved with `MAP_NORESERVE` and only becomes resident as requests use it, but pages a
+    /// request or reply touched are never returned, so a filesystem's resident memory can grow
+    /// to `online CPUs x depth x max_write` under a client that keeps every entry busy. On a
+    /// mount other users can reach (`allow_other`), lower `max_write` or the depth accordingly.
+    ///
+    /// The queues of one ring times the depth must fit io_uring's largest ring, 32768 entries
+    /// (73 per queue on a 448-CPU machine with one ring); a larger product falls back to
+    /// `/dev/fuse` with a warning.
+    pub io_uring_queue_depth: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            mount_options: Vec::new(),
+            acl: SessionACL::default(),
+            n_threads: None,
+            clone_fd: false,
+            io_uring: false,
+            io_uring_queue_depth: 8,
+        }
+    }
 }
 
 /// Mount options accepted by the FUSE filesystem type
@@ -379,6 +440,18 @@ mod test {
             .is_ok()
         );
     }
+
+    #[test]
+    fn config_defaults() {
+        let config = Config::default();
+        assert!(!config.io_uring);
+        assert_eq!(config.io_uring_queue_depth, 8);
+        assert!(config.mount_options.is_empty());
+        assert_eq!(config.acl, SessionACL::Owner);
+        assert_eq!(config.n_threads, None);
+        assert!(!config.clone_fd);
+    }
+
     #[test]
     fn option_value_checking() {
         use crate::mnt::mount_options::MountOption::*;

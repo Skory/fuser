@@ -14,6 +14,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::SystemTime;
 
+use log::debug;
 use log::error;
 use log::warn;
 
@@ -34,11 +35,15 @@ use crate::ll::reply::DirEntryPlus;
 use crate::ll::reply::Response;
 use crate::ll::{self};
 use crate::passthrough::BackingId;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use crate::uring::ring::RingCommit;
 
 /// Generic reply callback to send data
 #[derive(Debug, Clone)]
 pub(crate) enum ReplySender {
     Channel(ChannelSender),
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    Ring(RingCommit),
     #[cfg(test)]
     Assert(AssertSender),
     #[cfg(test)]
@@ -50,6 +55,8 @@ impl ReplySender {
     pub(crate) fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
         match self {
             ReplySender::Channel(sender) => sender.send(data),
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => commit.commit(data),
             #[cfg(test)]
             ReplySender::Assert(sender) => sender.send(data),
             #[cfg(test)]
@@ -60,10 +67,21 @@ impl ReplySender {
         }
     }
 
+    /// Records that a reply object was created for the request, so a transport that answers
+    /// unreplied requests itself knows one is coming.
+    pub(crate) fn reply_created(&self) {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        if let ReplySender::Ring(commit) = self {
+            commit.reply_created();
+        }
+    }
+
     /// Open a backing file
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
             ReplySender::Channel(sender) => sender.open_backing(fd),
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => BackingId::create(commit.device(), fd),
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -75,6 +93,8 @@ impl ReplySender {
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         match self {
             ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => unsafe { BackingId::wrap_raw(commit.device(), id) },
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -134,8 +154,13 @@ impl ReplyRaw {
         assert!(self.sender.is_some());
         let sender = self.sender.take().unwrap();
         let res = response.with_iovec(self.unique, |iov| sender.send(iov));
-        if let Err(err) = res {
-            error!("Failed to send FUSE reply: {err}");
+        match res {
+            Ok(()) => {}
+            // A reply after the connection ended is expected during teardown
+            Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {
+                debug!("Failed to send FUSE reply: {err}");
+            }
+            Err(err) => error!("Failed to send FUSE reply: {err}"),
         }
     }
     pub(crate) fn send_ll(mut self, response: &impl Response) {
