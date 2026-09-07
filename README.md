@@ -39,6 +39,16 @@ The kernel driver is provided by the FUSE project, the userspace implementation 
 
 Except for a single setup (mount) function call and a final teardown (umount) function call to libfuse, everything runs in Rust, and on Linux these calls to libfuse are optional. They can be removed by building without the "libfuse" feature flag.
 
+### Cargo features
+
+All features are off by default.
+
+- `libfuse`: mount and unmount through libfuse instead of the pure Rust implementation: libfuse3 if `pkg-config` finds it, otherwise libfuse2. `libfuse2` and `libfuse3` pin the version.
+- `experimental`: the async `Filesystem` API in `fuser::experimental`, which pulls in `tokio` and `async-trait`.
+- `serializable`: `serde` `Serialize`/`Deserialize` derives on `FileAttr`, `FileType` and the `ll` newtypes (`RequestId`, `INodeNo`, `FileHandle`, `LockOwner`, `Version`).
+- `macos-no-mount`: compiles out the mount implementations on macOS so the code builds without macFUSE; mounting does not work with it.
+- `io-uring`: the FUSE-over-io_uring transport, selected per session with `Config::io_uring`. It needs Linux 6.14 or later and the fuse module parameter `enable_uring=Y`; when the kernel does not offer it, the session logs a warning and uses `/dev/fuse`.
+
 ## Dependencies
 
 FUSE must be installed to build or run programs that use FUSE-Rust (i.e. kernel driver and libraries. Some platforms may also require userland utils like `fusermount`). A default installation of FUSE is usually sufficient.

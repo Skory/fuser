@@ -110,6 +110,14 @@ struct Args {
     #[clap(long, default_value_t = 1)]
     n_threads: usize,
 
+    /// Serve requests over FUSE-over-io_uring (needs the io-uring feature and enable_uring=Y)
+    #[clap(long)]
+    io_uring: bool,
+
+    /// Ring entries per kernel queue when `--io-uring` is set
+    #[clap(long, default_value_t = 8)]
+    io_uring_queue_depth: u32,
+
     /// Sets the level of verbosity
     #[clap(short, action = clap::ArgAction::Count)]
     v: u8,
@@ -3112,6 +3120,8 @@ fn main() {
     }
 
     cfg.n_threads = Some(args.n_threads);
+    cfg.io_uring = args.io_uring;
+    cfg.io_uring_queue_depth = args.io_uring_queue_depth;
     let result = fuser::mount(
         SimpleFS::new(args.data_dir, args.direct_io, args.suid, args.idmap),
         &args.mount_point,

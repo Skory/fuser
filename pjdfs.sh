@@ -13,13 +13,20 @@ export RUST_BACKTRACE=1
 DATA_DIR=$(mktemp --directory)
 DIR=$(mktemp --directory)
 
-fuser -vvv --auto-unmount --suid --data-dir $DATA_DIR --mount-point $DIR > /code/logs/mount.log 2>&1 &
+fuser -vvv --auto-unmount --suid --data-dir $DATA_DIR --mount-point $DIR $FUSER_URING_FLAGS > /code/logs/mount.log 2>&1 &
 FUSE_PID=$!
 sleep 0.5
 
 echo "mounting at $DIR"
 # Make sure FUSE was successfully mounted
 mount | grep fuser
+
+# A silent fallback to /dev/fuse must not pass as a ring run; requests block until the queues
+# are registered, so the line is there once stat returns
+if [ -n "$FUSER_URING_FLAGS" ]; then
+    timeout 30 stat "$DIR" > /dev/null
+    grep 'io_uring: ring [0-9]* registered' /code/logs/mount.log
+fi
 
 set +e
 cd ${DIR}
