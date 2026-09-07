@@ -105,6 +105,11 @@ mod request;
 mod request_param;
 mod session;
 mod time;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+// Self-removing once a production caller exists; the test build covers items unevenly
+#[cfg_attr(not(test), expect(dead_code, reason = "no production caller yet"))]
+#[cfg_attr(test, allow(dead_code))]
+mod uring;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]
