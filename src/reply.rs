@@ -48,6 +48,9 @@ pub(crate) enum ReplySender {
     Assert(AssertSender),
     #[cfg(test)]
     Sync(std::sync::mpsc::SyncSender<()>),
+    /// Hands every reply's bytes to the test, which can also see that none was sent.
+    #[cfg(test)]
+    Capture(std::sync::mpsc::Sender<Vec<u8>>),
 }
 
 impl ReplySender {
@@ -64,7 +67,51 @@ impl ReplySender {
                 sender.send(()).unwrap();
                 Ok(())
             }
+            #[cfg(test)]
+            ReplySender::Capture(sender) => {
+                let bytes = data.iter().flat_map(|s| s.iter().copied()).collect();
+                sender.send(bytes).unwrap();
+                Ok(())
+            }
         }
+    }
+
+    /// The ring writes into the entry's own buffer when it can; otherwise a heap buffer is
+    /// filled and sent. Exactly one reply is sent whatever `f` does.
+    pub(crate) fn fill<F>(&self, unique: ll::RequestId, max_len: usize, f: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        let f = match self {
+            ReplySender::Ring(commit) => match commit.fill(max_len, f)? {
+                None => return Ok(()),
+                Some(f) => f,
+            },
+            _ => f,
+        };
+        // Armed until the reply is out, so a panic while framing the count still answers EIO
+        let guard = EioOnUnwind {
+            sender: self,
+            unique,
+        };
+        let mut buf = vec![0u8; max_len];
+        let res = match f(&mut buf) {
+            Ok(n) if n <= max_len && n <= MAX_PAYLOAD => {
+                ll::ResponseSlice(&buf[..n]).with_iovec(unique, |iov| self.send(iov))
+            }
+            Ok(n) => {
+                error!(
+                    "reply for request {} claims {n} bytes in a {max_len} byte buffer; replying \
+                     EINVAL",
+                    unique.0
+                );
+                ll::ResponseErrno(Errno::EINVAL).with_iovec(unique, |iov| self.send(iov))
+            }
+            Err(errno) => ll::ResponseErrno(errno).with_iovec(unique, |iov| self.send(iov)),
+        };
+        std::mem::forget(guard);
+        res
     }
 
     /// Records that a reply object was created for the request, so a transport that answers
@@ -83,9 +130,9 @@ impl ReplySender {
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             ReplySender::Ring(commit) => BackingId::create(commit.device(), fd),
             #[cfg(test)]
-            ReplySender::Assert(_) => unreachable!(),
-            #[cfg(test)]
-            ReplySender::Sync(_) => unreachable!(),
+            ReplySender::Assert(_) | ReplySender::Sync(_) | ReplySender::Capture(_) => {
+                unreachable!()
+            }
         }
     }
 
@@ -96,10 +143,43 @@ impl ReplySender {
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             ReplySender::Ring(commit) => unsafe { BackingId::wrap_raw(commit.device(), id) },
             #[cfg(test)]
-            ReplySender::Assert(_) => unreachable!(),
-            #[cfg(test)]
-            ReplySender::Sync(_) => unreachable!(),
+            ReplySender::Assert(_) | ReplySender::Sync(_) | ReplySender::Capture(_) => {
+                unreachable!()
+            }
         }
+    }
+}
+
+/// The largest payload `fuse_out_header.len` can describe.
+const MAX_PAYLOAD: usize = u32::MAX as usize - size_of::<ll::fuse_abi::fuse_out_header>();
+
+/// Answers `EIO` if a `fill` closure unwinds, so the request gets its one reply; disarmed with
+/// `mem::forget` once the reply is sent.
+struct EioOnUnwind<'a> {
+    sender: &'a ReplySender,
+    unique: ll::RequestId,
+}
+
+impl Drop for EioOnUnwind<'_> {
+    fn drop(&mut self) {
+        warn!(
+            "Reply closure for operation {} panicked, replying with I/O error",
+            self.unique.0
+        );
+        let res =
+            ll::ResponseErrno(Errno::EIO).with_iovec(self.unique, |iov| self.sender.send(iov));
+        log_send(res);
+    }
+}
+
+/// Logs a failed send; a reply after the connection ended is expected during teardown.
+fn log_send(res: std::io::Result<()>) {
+    match res {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {
+            debug!("Failed to send FUSE reply: {err}");
+        }
+        Err(err) => error!("Failed to send FUSE reply: {err}"),
     }
 }
 
@@ -154,17 +234,21 @@ impl ReplyRaw {
         assert!(self.sender.is_some());
         let sender = self.sender.take().unwrap();
         let res = response.with_iovec(self.unique, |iov| sender.send(iov));
-        match res {
-            Ok(()) => {}
-            // A reply after the connection ended is expected during teardown
-            Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {
-                debug!("Failed to send FUSE reply: {err}");
-            }
-            Err(err) => error!("Failed to send FUSE reply: {err}"),
-        }
+        log_send(res);
     }
     pub(crate) fn send_ll(mut self, response: &impl Response) {
         self.send_ll_mut(response);
+    }
+
+    /// The sender answers a panic in `f` itself, so it is taken out first and `Drop` has
+    /// nothing left to do.
+    pub(crate) fn send_fill<F>(mut self, max_len: usize, f: F)
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        assert!(self.sender.is_some());
+        let sender = self.sender.take().unwrap();
+        log_send(sender.fill(self.unique, max_len, f));
     }
 
     /// Reply to a request with the given error code
@@ -233,6 +317,47 @@ impl ReplyData {
     /// Reply to a request with the given data
     pub fn data(self, data: &[u8]) {
         self.reply.send_ll(&ll::ResponseSlice(data));
+    }
+
+    /// Reply to a request with data produced directly into the transport's reply buffer.
+    ///
+    /// `f` receives a zeroed buffer of exactly `max_len` bytes and returns how many bytes it
+    /// filled, which is the length of the reply, or an error to reply with instead. Pass the
+    /// `size` of the request as `max_len`: the kernel never asks for more than the negotiated
+    /// `max_write`, which every transport can hold, whereas a `max_len` the transport cannot
+    /// hold is a caller bug answered with `EINVAL` without running `f`. `f` may also be
+    /// skipped once the connection has ended, when nothing is sent, as with `data()`. When `f`
+    /// does run the request gets exactly one reply: the bytes it reports, its error, `EINVAL`
+    /// for a count larger than `max_len` (or than a reply can carry), or `EIO` if it panics.
+    ///
+    /// Over io_uring the buffer is normally the ring entry's own, so the data is not copied
+    /// again on its way to the kernel; over `/dev/fuse` it is a heap buffer sent with
+    /// `writev(2)`, and the call behaves like `data()`.
+    ///
+    /// # Examples
+    ///
+    /// Serving a `read` request from a file without an intermediate buffer. A short count
+    /// means end of file to the kernel, which is right for a regular file; a source that may
+    /// return short reads before its end should loop until the buffer is full:
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::os::unix::fs::FileExt;
+    ///
+    /// use fuser::Errno;
+    /// use fuser::ReplyData;
+    ///
+    /// fn read(file: &File, offset: u64, size: u32, reply: ReplyData) {
+    ///     reply.fill(size as usize, |buf| {
+    ///         file.read_at(buf, offset).map_err(Errno::from)
+    ///     });
+    /// }
+    /// ```
+    pub fn fill<F>(self, max_len: usize, f: F)
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        self.reply.send_fill(max_len, f);
     }
 
     /// Reply to a request with the given error code
@@ -1027,6 +1152,99 @@ mod test {
         });
         let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
         reply.data(&[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// Runs `fill` against a `Capture` sender and returns the one reply it sent
+    fn filled<F>(max_len: usize, f: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), ReplySender::Capture(tx));
+        reply.fill(max_len, f);
+        let sent = rx.try_recv().expect("no reply was sent");
+        assert!(rx.try_recv().is_err(), "a second reply was sent");
+        sent
+    }
+
+    fn data_reply(payload: &[u8]) -> Vec<u8> {
+        let mut expected = vec![
+            0x10 + payload.len() as u8,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        expected.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00]);
+        expected.extend_from_slice(payload);
+        expected
+    }
+
+    fn errno_reply(errno: i32) -> Vec<u8> {
+        let mut expected = vec![0x10, 0x00, 0x00, 0x00];
+        expected.extend_from_slice(&(-errno).to_ne_bytes());
+        expected.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00]);
+        expected
+    }
+
+    /// The same wire bytes as `data`, from a closure that fills the whole zeroed buffer
+    #[test]
+    fn reply_fill() {
+        let sent = filled(4, |buf| {
+            assert_eq!(buf, [0, 0, 0, 0]);
+            buf.copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            Ok(buf.len())
+        });
+        assert_eq!(sent, data_reply(&[0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    /// Bytes the closure reported but did not write go out as zeros
+    #[test]
+    fn reply_fill_sends_the_count() {
+        let sent = filled(8, |buf| {
+            assert_eq!(buf.len(), 8);
+            buf[..2].copy_from_slice(&[0xde, 0xad]);
+            buf[2..].copy_from_slice(&[0xff; 6]);
+            Ok(2)
+        });
+        assert_eq!(sent, data_reply(&[0xde, 0xad]));
+        let sent = filled(4, |buf| {
+            buf[0] = 1;
+            Ok(4)
+        });
+        assert_eq!(sent, data_reply(&[1, 0, 0, 0]));
+    }
+
+    #[test]
+    fn reply_fill_rejects_a_count_beyond_the_buffer() {
+        let sent = filled(4, |buf| {
+            buf.fill(0xaa);
+            Ok(5)
+        });
+        assert_eq!(sent, errno_reply(libc::EINVAL));
+    }
+
+    #[test]
+    fn reply_fill_error() {
+        assert_eq!(filled(4, |_| Err(Errno::ENOENT)), errno_reply(libc::ENOENT));
+    }
+
+    #[test]
+    fn reply_fill_panic_replies_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), ReplySender::Capture(tx));
+        let result = thread::spawn(move || {
+            reply.fill(4, |_| -> Result<usize, Errno> {
+                panic!("deliberate panic in fill")
+            });
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(rx.try_recv().unwrap(), errno_reply(libc::EIO));
+        assert!(rx.try_recv().is_err(), "a second reply was sent");
     }
 
     #[test]
